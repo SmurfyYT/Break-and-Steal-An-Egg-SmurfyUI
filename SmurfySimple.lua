@@ -10,6 +10,7 @@
     Glide   : fastest glide speed the server accepts.
     Endure  : how long you can stay hidden (5, 15, 30, 60 s) before something happens.
     Under   : travel under the map and come up at the target.
+    Remotes : remote spy — what your client sends (→) and receives (←); never sends anything.
 
     Hiding methods (what replicates right after physics, then you're put back on a "hold"
     point before the next physics step and before drawing, so you stand still on screen):
@@ -857,6 +858,7 @@ local warmupPage = makePage("Warmup")
 local glidePage = makePage("Glide")
 local endurePage = makePage("Endure")
 local underPage = makePage("Under")
+local remotesPage = makePage("Remotes")
 
 ---------------- Main
 label(mainPage, "Movement Lab. Each tab is one test: stand somewhere open, press its green button, then send the results.\nDrag the top bar to move. <b>–</b> hides the window (tap <b>S</b> to bring it back).")
@@ -1076,6 +1078,166 @@ button(underPage, "Run all depths", Theme.On, function()
     end, underOut)
 end)
 
+---------------- Remotes (spy: what your client sends and receives; read-only)
+local Spy = { Out = true, In = true, Rows = {}, Order = {}, Conns = {}, Hooked = false }
+
+-- short text for an argument
+local function fmtArg(v, depth)
+    local t = typeof(v)
+    if t == "Instance" then return v.Name end
+    if t == "string" then return '"' .. (#v > 24 and (v:sub(1, 24) .. "…") or v) .. '"' end
+    if t == "number" then return tostring(math.floor(v * 100 + 0.5) / 100) end
+    if t == "Vector3" then return ("V3(%d,%d,%d)"):format(v.X, v.Y, v.Z) end
+    if t == "CFrame" then local p = v.Position return ("CF(%d,%d,%d)"):format(p.X, p.Y, p.Z) end
+    if t == "table" then
+        if (depth or 0) >= 1 then return "{…}" end
+        local parts, n = {}, 0
+        for k, x in pairs(v) do
+            n += 1
+            if n > 4 then table.insert(parts, "…") break end
+            table.insert(parts, (type(k) == "string" and (k .. "=") or "") .. fmtArg(x, (depth or 0) + 1))
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    end
+    return tostring(v)
+end
+local function fmtArgs(...)
+    local n = select("#", ...)
+    local parts = {}
+    for i = 1, math.min(n, 5) do table.insert(parts, fmtArg((select(i, ...)))) end
+    if n > 5 then table.insert(parts, "…") end
+    return "(" .. table.concat(parts, ", ") .. ")"
+end
+
+local spyRender -- set below
+local spyDirty = false
+local function spyLog(dir, remote, ...)
+    if not App.Alive or not Spy.On then return end
+    if (dir == "→" and not Spy.Out) or (dir == "←" and not Spy.In) then return end
+    local key = dir .. remote:GetFullName()
+    local row = Spy.Rows[key]
+    if not row then
+        row = { Dir = dir, Name = remote.Name, Count = 0 }
+        Spy.Rows[key] = row
+    end
+    row.Count += 1
+    row.Last = fmtArgs(...)
+    row.At = os.clock()
+    spyDirty = true
+end
+
+-- incoming: listen to every RemoteEvent the game has
+local function watchRemote(r)
+    if r:IsA("RemoteEvent") or r:IsA("UnreliableRemoteEvent") then
+        table.insert(Spy.Conns, r.OnClientEvent:Connect(function(...) spyLog("←", r, ...) end))
+    end
+end
+local function startIncoming()
+    for _, c in ipairs(Spy.Conns) do c:Disconnect() end
+    table.clear(Spy.Conns)
+    local rs = game:GetService("ReplicatedStorage")
+    for _, d in ipairs(rs:GetDescendants()) do watchRemote(d) end
+    table.insert(Spy.Conns, rs.DescendantAdded:Connect(watchRemote))
+end
+
+-- outgoing: the game's own FireServer / InvokeServer calls (needs hookmetamethod)
+local namecallOriginal
+local function startOutgoing()
+    if namecallOriginal then return true end
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" or type(newcclosure) ~= "function" then
+        return false
+    end
+    local ok = pcall(function()
+        namecallOriginal = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            if Spy.On and App.Alive then
+                local method = getnamecallmethod()
+                if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance"
+                    and not (type(checkcaller) == "function" and checkcaller()) then
+                    pcall(spyLog, "→", self, ...)
+                end
+            end
+            return namecallOriginal(self, ...)
+        end))
+    end)
+    return ok and namecallOriginal ~= nil
+end
+local function removeSpyHook()
+    if namecallOriginal then
+        pcall(hookmetamethod, game, "__namecall", namecallOriginal)
+        namecallOriginal = nil
+    end
+end
+
+label(remotesPage, "<b>Remote spy</b>: lists the remotes your game client sends (→) and receives (←), how often, and the last arguments. Just watching — it never sends anything itself.")
+local spyInfo = label(remotesPage, "")
+toggle(remotesPage, "Spy on remotes", function() return Spy.On == true end, function(v)
+    Spy.On = v
+    if v then
+        startIncoming()
+        Spy.CanOut = startOutgoing()
+    else
+        for _, c in ipairs(Spy.Conns) do c:Disconnect() end
+        table.clear(Spy.Conns)
+    end
+    spyInfo.Text = v and (Spy.CanOut and "Watching both ways." or "Watching ← only (this executor has no hookmetamethod, so → can't be seen).") or ""
+    spyDirty = true
+end)
+toggle(remotesPage, "Show sent (→)", function() return Spy.Out end, function(v) Spy.Out = v end)
+toggle(remotesPage, "Show received (←)", function() return Spy.In end, function(v) Spy.In = v end)
+local spyOut = resultsBox(remotesPage)
+spyRender = function()
+    local list = {}
+    for _, row in pairs(Spy.Rows) do
+        if (row.Dir == "→" and Spy.Out) or (row.Dir == "←" and Spy.In) then table.insert(list, row) end
+    end
+    table.sort(list, function(a, b) return a.At > b.At end)
+    local lines = {}
+    for i = 1, math.min(#list, 25) do
+        local r = list[i]
+        table.insert(lines, ("%s %s ×%d\n   %s"):format(r.Dir, r.Name, r.Count, r.Last or ""))
+    end
+    spyOut(#lines > 0 and table.concat(lines, "\n") or (Spy.On and "(nothing yet — play a bit)" or "(spy is off)"))
+end
+spyRender()
+button(remotesPage, "Clear", nil, function()
+    table.clear(Spy.Rows)
+    spyRender()
+end)
+button(remotesPage, "Copy list", nil, function()
+    local lines = {}
+    for _, row in pairs(Spy.Rows) do
+        table.insert(lines, ("%s %s x%d %s"):format(row.Dir == "→" and "OUT" or "IN", row.Name, row.Count, row.Last or ""))
+    end
+    table.sort(lines)
+    if type(setclipboard) == "function" then
+        pcall(setclipboard, table.concat(lines, "\n"))
+        spyInfo.Text = "Copied " .. #lines .. " lines."
+    else
+        spyInfo.Text = "This executor can't copy (no setclipboard)."
+    end
+end)
+local allOut = resultsBox(remotesPage)
+button(remotesPage, "List every remote in the game", nil, function()
+    local names = {}
+    for _, d in ipairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then
+            table.insert(names, (d:IsA("RemoteFunction") and "F " or "E ") .. d.Name)
+        end
+    end
+    table.sort(names)
+    allOut(#names .. " remotes (E = event, F = function)\n" .. table.concat(names, "\n"))
+end)
+-- redraw a few times a second at most
+task.spawn(function()
+    while App.Alive do
+        if spyDirty then
+            spyDirty = false
+            spyRender()
+        end
+        task.wait(0.3)
+    end
+end)
+
 showPage("Main")
 
 track(LocalPlayer.CharacterAdded:Connect(function()
@@ -1090,6 +1252,9 @@ unload = function()
     App.Alive = false
     stopLab()
     removeGhostHook()
+    Spy.On = false
+    removeSpyHook()
+    for _, c in ipairs(Spy.Conns) do pcall(function() c:Disconnect() end) end
     for _, c in ipairs(App.Conns) do pcall(function() c:Disconnect() end) end
     table.clear(App.Conns)
     pcall(function() gui:Destroy() end)

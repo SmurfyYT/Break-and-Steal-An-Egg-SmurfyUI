@@ -59,6 +59,34 @@ for _, i in ipairs(__all()) do
 end
 check(clickIn("Main", "Restore settings") and true, "Main has Restore settings")
 
+-- Remotes: spy sees the game's own sends and the server's messages, and never sends anything
+check(page("Remotes") ~= nil, "tab: Remotes")
+clickIn("Remotes", "Spy on remotes")
+local infoOk = false
+for _, i in ipairs(page("Remotes"):GetChildren()) do
+    if i.ClassName == "TextLabel" and type(i.Text) == "string" and i.Text:find("both ways") then infoOk = true end
+end
+check(infoOk, "spy watches both ways when hookmetamethod exists")
+local calls = __SG.serverCalls
+__SG.remotes.EggHitRequest:FireServer(__SG.remotes.EggHitRequest, 3)
+__SG.remotes.EggHitRequest:FireServer(__SG.remotes.EggHitRequest, 4)
+__SG.remotes.Notify.OnClientEvent:Fire("You stole an egg!", { Kind = "Info" })
+__runFrames(30)
+local spyText = results("Remotes")
+check(spyText:find("→ EggHitRequest ×2", 1, true) ~= nil, "sent remote listed with its count")
+check(spyText:find("(EggHitRequest, 4)", 1, true) ~= nil, "...and its last arguments")
+check(spyText:find("← Notify ×1", 1, true) ~= nil, "received remote listed")
+check(spyText:find('"You stole an egg!"', 1, true) ~= nil, "...with its arguments")
+check(__SG.serverCalls == calls + 2, "the game's own sends still reach the server (spy passes them on)")
+clickIn("Remotes", "Copy list")
+check((__SG.clipboard() or ""):find("OUT EggHitRequest x2", 1, true) ~= nil, "copy list puts it on the clipboard")
+clickIn("Remotes", "List every remote")
+check(results("Remotes"):find("4 remotes", 1, true) ~= nil and results("Remotes"):find("F BackpackSellRemote", 1, true) ~= nil, "lists every remote in the game")
+clickIn("Remotes", "Spy on remotes") -- off
+__SG.remotes.EggHitRequest:FireServer(__SG.remotes.EggHitRequest, 5)
+__runFrames(30)
+check(results("Remotes"):find("×3", 1, true) == nil, "spy off: nothing more logged")
+
 -- Snap: quick check (plain 50 studs) gets pulled back, and the watcher sees the pull
 clickIn("Snap", "Quick check")
 check(waitDone("Snap", 20), "snap quick check finishes")
@@ -150,6 +178,9 @@ check(gone, "unload removes the UI")
 local hf = __SG.hiddenFrames
 __runFrames(30)
 check(__SG.hiddenFrames == hf, "nothing hidden after unload")
+local before = __SG.serverCalls
+__SG.remotes.EggHitRequest:FireServer(__SG.remotes.EggHitRequest, 6)
+check(__SG.serverCalls == before + 1, "after unload remotes still work (hook removed)")
 
 if #__errors > 0 then
     local seen = {}

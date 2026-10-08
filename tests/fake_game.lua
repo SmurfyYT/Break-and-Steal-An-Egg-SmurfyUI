@@ -115,3 +115,34 @@ function __runFrames(n)
         end
     end
 end
+
+-- remotes + a pretend executor hook (__namecall) so the Remotes tab can be tested
+SG.serverCalls = 0
+SG.remotes = {}
+for _, name in ipairs({ "EggHitRequest", "Notify", "PlaceAnimalRemote" }) do
+    local r = newInstance("RemoteEvent", name)
+    r.__server = function() SG.serverCalls += 1 end
+    r.Parent = Services.ReplicatedStorage
+    SG.remotes[name] = r
+end
+local fn = newInstance("RemoteFunction", "BackpackSellRemote"); fn.Parent = Services.ReplicatedStorage
+local realFire = methods.FireServer
+local hooks, namecallMethod = {}, nil
+methods.FireServer = function(self, ...)
+    if hooks.__namecall then
+        namecallMethod = "FireServer"
+        return hooks.__namecall(self, ...)
+    end
+    return realFire(self, ...)
+end
+function hookmetamethod(_, mm, f)
+    local old = hooks[mm] or function(self, ...) return realFire(self, ...) end
+    hooks[mm] = f
+    return old
+end
+function getnamecallmethod() return namecallMethod end
+function newcclosure(f) return f end
+function checkcaller() return false end
+local clip
+function setclipboard(t) clip = t end
+function SG.clipboard() return clip end

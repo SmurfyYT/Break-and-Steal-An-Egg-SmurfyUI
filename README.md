@@ -24,6 +24,7 @@ away (a server pull-back), **DIED** if you die. Each trial goes back to where yo
 | **Glide** | Slide there at 100, 300, 1000, 3000, 10000 studs/s; shows the fastest that's accepted. |
 | **Endure** | Stay hidden 5, 15, 30, 60 s, then check you're alive and not pulled. |
 | **Under** | Drop under the floor (20 / 50 / 100 studs), glide under the map with no collisions, come up at the target. Stays 50 studs above the game's kill height. |
+| **Remotes** | Remote spy: every remote your client sends (→) and receives (←), how often, last arguments. Copy list, list every remote in the game. Only watches, never sends. Sent (→) needs `hookmetamethod`. |
 
 ### Hiding methods
 Both change what replicates right after physics (Heartbeat), then put you back on a "hold" point
