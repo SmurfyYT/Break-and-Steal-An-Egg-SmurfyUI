@@ -5,7 +5,7 @@
     Main    : restore settings, unload.
     Snap    : live snap-back watcher (did the server drag you back?) + a quick check.
     Ladder  : plain teleports at growing distances: where does the server pull you back?
-    Methods : Plain / Ghost / Fling / Glide side by side at 50, 250, 1000 studs.
+    Methods : Plain / Ghost / Fling / Glide / Velocity / VForce / PlatStand at 50, 250, 1000 studs.
     Warmup  : how long you must be hidden before the jump (0, 1 frame, 0.05, 0.15, 0.5 s).
     Glide   : fastest glide speed the server accepts.
     Endure  : how long you can stay hidden (5, 15, 30, 60 s) before something happens.
@@ -473,7 +473,8 @@ local function glidePath(points, speed, token)
     return labRunning(token)
 end
 
--- go to target with a method: "Plain", "Ghost", "Fling", or "Glide"
+-- go to target with a method: "Plain", "Ghost", "Fling", "Glide",
+-- "Velocity", "VForce", or "PlatStand"
 local function travel(method, target, token, opts)
     opts = opts or {}
     local root = getRoot()
@@ -485,6 +486,58 @@ local function travel(method, target, token, opts)
         RunService.Stepped:Wait()
     elseif method == "Glide" then
         glidePath({ root.Position, target.Position }, opts.speed or 300, token)
+    elseif method == "Velocity" then
+        -- raw AssemblyLinearVelocity: fling without hiding, let physics carry the character
+        local dir = (target.Position - root.Position)
+        local dist = dir.Magnitude
+        if dist < 0.1 then return labRunning(token) end
+        local speed = opts.speed or math.clamp(dist / 0.4, 50, 2000)
+        markOwn(dist / speed + 0.5)
+        zeroMotion(root)
+        root.AssemblyLinearVelocity = dir.Unit * speed
+        -- wait until close enough or time runs out
+        local t0 = os.clock()
+        local limit = dist / speed + 0.5
+        while labRunning(token) and os.clock() - t0 < limit do
+            local r2 = getRoot()
+            if not r2 then break end
+            if (r2.Position - target.Position).Magnitude < 4 then break end
+            RunService.Stepped:Wait()
+        end
+        local r2 = getRoot()
+        if r2 then zeroMotion(r2) end
+    elseif method == "VForce" then
+        -- VectorForce impulse: use physics engine to push the character
+        local dir = (target.Position - root.Position)
+        local dist = dir.Magnitude
+        if dist < 0.1 then return labRunning(token) end
+        local speed = opts.speed or math.clamp(dist / 0.4, 50, 2000)
+        local mass = root.AssemblyMass > 0 and root.AssemblyMass or 1
+        local att = Instance.new("Attachment")
+        att.Parent = root
+        local vf = Instance.new("VectorForce")
+        vf.Attachment0 = att
+        vf.RelativeTo = Enum.ActuatorRelativeTo.World
+        vf.ApplyAtCenterOfMass = true
+        vf.Force = dir.Unit * mass * speed * 60  -- one-frame impulse equivalent
+        vf.Parent = root
+        markOwn(dist / speed + 0.5)
+        RunService.Stepped:Wait()  -- let physics apply one frame of force
+        pcall(function() vf:Destroy() att:Destroy() end)
+        -- glide the rest of the way so the test reaches the target reliably
+        glidePath({ (getRoot() or root).Position, target.Position }, speed, token)
+    elseif method == "PlatStand" then
+        -- PlatformStand disables humanoid joint control; CFrame the character while it's off
+        local hum = getHumanoid()
+        if hum then
+            pcall(function() hum.PlatformStand = true end)
+            RunService.Stepped:Wait()  -- let humanoid relinquish joints
+        end
+        markOwn()
+        zeroMotion(root)
+        root.CFrame = target
+        RunService.Stepped:Wait()
+        if hum then pcall(function() hum.PlatformStand = false end) end
     else
         local m = method == "Fling" and Fling or Ghost
         if (m == Fling and Ghost.On) or (m == Ghost and Fling.On) then stopMovers() end
@@ -911,18 +964,28 @@ runStop(ladderPage, "Run ladder", ladderOut, function(token, out)
 end)
 
 ---------------- Methods
-label(methodsPage, "<b>Method showdown</b>: Plain TP, Ghost TP, Fling TP and a 300 studs/s glide, each at 50, 250 and 1000 studs. Takes about a minute.")
+label(methodsPage, "<b>Method showdown</b>: 7 movement methods at 50, 250 and 1000 studs. Plain/Ghost/Fling/Glide + Velocity (raw physics), VForce (VectorForce impulse), PlatStand (PlatformStand+CFrame). Takes about 2 minutes.")
 local methodsOut = resultsBox(methodsPage)
-local METHODS = { "Plain", "Ghost", "Fling", "Glide" }
+local METHODS = {
+    { "Plain",     "Pln" },
+    { "Ghost",     "Gst" },
+    { "Fling",     "Flg" },
+    { "Glide",     "Gld" },
+    { "Velocity",  "Vel" },
+    { "VForce",    "VFc" },
+    { "PlatStand", "Plt" },
+}
 runStop(methodsPage, "Run showdown", methodsOut, function(token, out)
     local grid = {}
     local function render(extra)
-        local rows = { "studs  Plain Ghost Fling Glide" }
+        local header = "studs"
+        for _, m in ipairs(METHODS) do header ..= " " .. m[2] end
+        local rows = { header }
         for _, d in ipairs({ 50, 250, 1000 }) do
-            local row = ("%5d "):format(d)
+            local row = ("%5d"):format(d)
             for _, m in ipairs(METHODS) do
-                local r = grid[d .. m]
-                row ..= " " .. (r == nil and "  .  " or ("%-5s"):format(short(r)))
+                local r = grid[d .. m[1]]
+                row ..= " " .. (r == nil and " .  " or ("%-4s"):format(short(r)))
             end
             table.insert(rows, row)
         end
@@ -931,8 +994,8 @@ runStop(methodsPage, "Run showdown", methodsOut, function(token, out)
     for _, d in ipairs({ 50, 250, 1000 }) do
         for _, m in ipairs(METHODS) do
             if not labRunning(token) then return end
-            render(("testing %s %d..."):format(m, d))
-            grid[d .. m] = trial(m, d, token, { speed = 300 })
+            render(("testing %s %d..."):format(m[1], d))
+            grid[d .. m[1]] = trial(m[1], d, token, { speed = 300 })
         end
     end
     render("ok = stayed, BACK = pulled back, -- = no ground\nDone.")
