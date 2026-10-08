@@ -17,11 +17,8 @@ local function click(text)
     return true
 end
 
--- zone 1: three eggs (3 hits each); zone 2: one egg; a stray animal from someone else's egg
-__SG.spawnEgg(1, "Forest Egg", Vector3.new(-250, 2.5, 0), 3)
-__SG.spawnEgg(1, "Forest Egg", Vector3.new(-270, 2.5, 20), 3)
-__SG.spawnEgg(1, "Rock Egg", Vector3.new(-290, 2.5, -20), 3)
-__SG.dropAnimal(Vector3.new(-246, 2.5, 6), 999, "Stray")
+-- one egg for the manual tests; each farm round spawns its own (see farmRound)
+__SG.spawnEgg(2, "Swamp Egg", Vector3.new(-620, 2.5, 40), 3)
 
 local ok, err = xpcall(__main, debug.traceback)
 check(ok, "script loads" .. (ok and "" or (": " .. tostring(err))))
@@ -32,73 +29,99 @@ __SG.autoSwing.SetOn(true)
 __runFrames(5)
 check(__SG.autoSwingOn() == false, "...and turned back off if something switches it on")
 
-for _, text in ipairs({ "Restore settings", "Unload", "Auto farm (fling)", "Zone: ", "Fling power: ",
-    "Fling in place", "Fling TP → nearest egg", "Fling TP → outside my plot" }) do
+for _, text in ipairs({ "Restore settings", "Unload", "Auto farm", "Zone: ", "Method: Ghost", "Fling power: ",
+    "Hide in place", "TP → nearest egg", "TP → outside my plot" }) do
     check(buttonStarting(text) ~= nil, "button: " .. text)
 end
 
--- manual: fling in place keeps you still
+local function reset()
+    for _, k in ipairs({ "hits", "fastHits", "farHits", "unheldHits", "broken", "taken", "banked", "flungFrames",
+        "flungOnPlot", "bankedWhileFlung", "carriedUnflungOutside" }) do __SG[k] = 0 end
+    for _, k in ipairs({ "earlyHits", "flungHits", "noWalkOutHits", "jumps", "unflungJumps", "multiFrameTrips",
+        "maxSpeed", "ghostFrames", "takenNames", "notStillFrames" }) do __SG[k] = nil end
+    __SG.log = {}
+end
+
+-- manual: hide (ghost) in place keeps you still, server sees you far away
 check(__inHitbox(__root.Position), "test starts on the plot")
-click("Fling in place")
+click("Hide in place")
 __runFrames(60 * 5) -- walks off the plot first
-check(not __inHitbox(__root.Position), "fling in place walks off the plot first")
+check(not __inHitbox(__root.Position), "hide in place walks off the plot first")
 check((__SG.unflungJumps or 0) == 0, "...walking, not a visible step")
-__SG.flungFrames = 0
+reset()
 local startPos = __root.Position
 __runFrames(120)
-check(__SG.flungFrames >= 100, "fling in place sends a flung character (" .. __SG.flungFrames .. " frames)")
-check((__root.Position - startPos).Magnitude < 0.01, "fling in place: you stay still")
+check((__SG.ghostFrames or 0) >= 100, "ghost in place: the server sees you far away (" .. (__SG.ghostFrames or 0) .. " frames)")
+check((__root.Position - startPos).Magnitude < 0.01, "ghost in place: you stay still")
 check(not __SG.notStillFrames, "velocity zeroed before every physics step")
-click("Fling in place")
+click("Hide in place")
 __runFrames(10)
-local flungBefore = __SG.flungFrames
+local before = __SG.flungFrames
 __runFrames(30)
-check(__SG.flungFrames == flungBefore, "turning it off stops the fling")
+check(__SG.flungFrames == before, "turning it off: the server sees you again")
 
--- manual: TP outside plot lands outside, unflung
-click("Fling TP → outside my plot")
+-- manual: TP outside plot lands outside, not hidden
+click("TP → outside my plot")
 __runFrames(60)
 check(not __inHitbox(__root.Position), ("outside-plot TP lands outside the hitbox (x=%.1f z=%.1f)"):format(__root.Position.X, __root.Position.Z))
 check(math.abs(__root.Position.X) < 60 and math.abs(__root.Position.Z) < 60, "...and right next to it")
-check(not __SG.lastFlung, "...and the fling is off after landing")
+check(not __SG.lastFlung, "...and not hidden after landing")
 
--- auto farm, zone 1
-__SG.flungOnPlot = 0
-__SG.expectWalkOut = true
+-- one auto farm round in zone 1 with the current method
+local round = 0
+local function farmRound(method)
+    round += 1
+    reset()
+    __SG.expectWalkOut = true
+    local z = 20 * round
+    __SG.spawnEgg(1, "Forest Egg", Vector3.new(-250, 2.5, z), 3)
+    __SG.spawnEgg(1, "Forest Egg", Vector3.new(-270, 2.5, z + 20), 3)
+    __SG.spawnEgg(1, "Rock Egg", Vector3.new(-290, 2.5, z - 20), 3)
+    __SG.dropAnimal(Vector3.new(-246, 2.5, z + 6), 900 + round, "Stray")
+    click("Auto farm")
+    __runFrames(60 * 120)
+    click("Auto farm")
+    __runFrames(30)
+    for _, line in ipairs(__SG.log) do print("    " .. line) end
+    local p = "[" .. method .. "] "
+    check(__SG.broken == 3, p .. "all 3 zone-1 eggs broken (" .. __SG.broken .. ")")
+    check((__SG.earlyHits or 0) == 0, p .. "waits 1 second next to each egg before swinging (" .. (__SG.earlyHits or 0) .. " early hits)")
+    check((__SG.flungHits or 0) == 0, p .. "mines while the server sees you (" .. (__SG.flungHits or 0) .. " hidden hits)")
+    check((__SG.noWalkOutHits or 0) == 0, p .. "walks out of dig reach and back before mining (" .. (__SG.noWalkOutHits or 0) .. " hits without)")
+    check((__SG.jumps or 0) >= 6, p .. "trips happened as jumps (" .. (__SG.jumps or 0) .. ")")
+    check((__SG.unflungJumps or 0) == 0, p .. "every jump is hidden the frame before and the frame of it (" .. (__SG.unflungJumps or 0) .. " not)")
+    check((__SG.multiFrameTrips or 0) == 0, p .. "each trip is a single-frame jump (" .. (__SG.multiFrameTrips or 0) .. ")")
+    check(__SG.fastHits == 0, p .. "never hit faster than the swing cooldown (" .. __SG.fastHits .. ")")
+    check(__SG.farHits == 0, p .. "every hit in range of where the server sees you (" .. __SG.farHits .. " too far)")
+    check(__SG.unheldHits == 0, p .. "pickaxe always held (" .. __SG.unheldHits .. ")")
+    check(__SG.taken == 3, p .. "waited out the hatch: all 3 animals grabbed (" .. __SG.taken .. ")")
+    local tookStray = false
+    for _, n in ipairs(__SG.takenNames or {}) do if n == "Stray" then tookStray = true end end
+    check(not tookStray, p .. "grabbed the egg's own animal (HatchId), not the stray")
+    check(__SG.banked == 3, p .. "all 3 banked (" .. __SG.banked .. ")")
+    check(__SG.flungOnPlot == 0, p .. "never hidden while on the plot (" .. __SG.flungOnPlot .. " frames)")
+    check(__SG.bankedWhileFlung == 0, p .. "banking only happens once you're not hidden")
+    check(__SG.carriedUnflungOutside == 0, p .. "hidden the whole way home while carrying (" .. __SG.carriedUnflungOutside .. " frames exposed)")
+    check(not __SG.lastFlung, p .. "stopping the farm stops hiding")
+    check(__SG.autoSwingOn() == false, p .. "Auto Swing still off after farming")
+end
+
 click("Zone: ") -- Any -> 1
-click("Auto farm (fling)")
-__runFrames(60 * 120)
-click("Auto farm (fling)")
-__runFrames(30)
-for _, line in ipairs(__SG.log) do print("    " .. line) end
-check(__SG.broken == 3, "all 3 zone-1 eggs broken (" .. __SG.broken .. ")")
-check((__SG.earlyHits or 0) == 0, "waits 1 second next to each egg before swinging (" .. (__SG.earlyHits or 0) .. " early hits)")
-check((__SG.flungHits or 0) == 0, "mines without the fling (" .. (__SG.flungHits or 0) .. " flung hits)")
-check((__SG.noWalkOutHits or 0) == 0, "walks out of dig reach and back before mining (" .. (__SG.noWalkOutHits or 0) .. " hits without)")
-check((__SG.jumps or 0) >= 6, "trips happened as jumps (" .. (__SG.jumps or 0) .. ")")
-check((__SG.unflungJumps or 0) == 0, "every jump is flung the frame before and the frame of it (" .. (__SG.unflungJumps or 0) .. " not)")
-check((__SG.multiFrameTrips or 0) == 0, "each trip is a single-frame jump, no visible hops (" .. (__SG.multiFrameTrips or 0) .. ")")
-check((__SG.maxSpeed or 0) >= 1e6, ("Max fling power by default (%.0f)"):format(__SG.maxSpeed or 0))
+farmRound("Ghost")
+check((__SG.ghostFrames or 0) > 0 and (__SG.maxSpeed or 0) < 1000, "[Ghost] hides by position, not speed")
+
+click("Method: ") -- Ghost -> Fling
+check(buttonStarting("Method: Fling") ~= nil, "method switched to Fling")
+farmRound("Fling")
+check((__SG.maxSpeed or 0) >= 1e6, ("[Fling] Max fling power by default (%.0f)"):format(__SG.maxSpeed or 0))
+check((__SG.ghostFrames or 0) == 0, "[Fling] hides by speed, not position")
 check(buttonStarting("Fling power: Max") ~= nil, "power button shows Max")
-check(__SG.fastHits == 0, "never hit faster than the swing cooldown (" .. __SG.fastHits .. ")")
-check(__SG.farHits == 0, "every hit in range (" .. __SG.farHits .. " too far)")
-check(__SG.unheldHits == 0, "pickaxe always held (" .. __SG.unheldHits .. ")")
-check(__SG.taken == 3, "waited out the hatch: all 3 animals grabbed (" .. __SG.taken .. ")")
-local tookStray = false
-for _, n in ipairs(__SG.takenNames or {}) do if n == "Stray" then tookStray = true end end
-check(not tookStray, "grabbed the egg's own animal (HatchId), not the stray")
-check(__SG.banked == 3, "all 3 banked (" .. __SG.banked .. ")")
-check(__SG.flungOnPlot == 0, "never flung while on the plot (" .. __SG.flungOnPlot .. " frames)")
-check(__SG.bankedWhileFlung == 0, "banking only happens after the fling stops")
-check(__SG.carriedUnflungOutside == 0, "flung the whole way home while carrying (" .. __SG.carriedUnflungOutside .. " frames exposed)")
-check(not __SG.lastFlung, "stopping the farm stops the fling")
-check(__SG.autoSwingOn() == false, "Auto Swing still off after farming")
 
 __SG.expectWalkOut = false
 -- zone 2 egg isn't touched when zone 1 is selected
 __SG.spawnEgg(2, "Swamp Egg", Vector3.new(-600, 2.5, 0), 3)
 local hits = __SG.hits
-click("Auto farm (fling)")
+click("Auto farm")
 __runFrames(60 * 5)
 check(__SG.hits == hits, "zone filter: zone 2 egg ignored while zone 1 is picked")
 click("Stop everything")
@@ -108,6 +131,7 @@ __runFrames(10)
 click("Restore settings")
 __runFrames(5)
 check(buttonStarting("Zone: Any") ~= nil, "restore settings resets the zone")
+check(buttonStarting("Method: Ghost") ~= nil, "restore settings resets the method")
 
 click("Unload")
 __runFrames(30)

@@ -3,23 +3,25 @@
     Made for Delta (Android / BlueStacks). Paste the whole file into the executor.
 
     Main tab : restore settings, unload.
-    Test tab : "fling TP" + auto farm.
+    Test tab : hidden TP (Ghost or Fling) + auto farm.
 
-    Fling TP: every frame, right after physics (Heartbeat) the character's velocity
-    is set to a huge number, so what gets sent to the server / other players is a
-    character being flung out of the universe. Before the next physics step
-    (Stepped / RenderStepped) the velocity is zeroed again and the character is
-    pinned to a "hold" CFrame, so on your screen you stand perfectly still and can
-    keep hitting eggs and pressing prompts. Teleporting = moving that hold point
-    (in hops) while the fling is on.
+    Both methods hide where you are from the server / other players, while on your own
+    screen you stand still on a "hold" CFrame:
+      Ghost: right after physics (Heartbeat) your CFrame is moved 9e9 studs away, so that's
+             what replicates. The game's own scripts still read your real spot (hookmetamethod).
+      Fling: right after physics your velocity is set huge, so you look flung out of the map.
+    Before the next physics step and before drawing (Stepped / RenderStepped) you're put back
+    on the hold point. A TP = hidden in place for a moment, then the hold point jumps in one frame.
+    Hitting eggs, grabbing animals and banking need the server to see you there, so the ghost
+    is off for those.
 
     Auto farm (game rules from the place's client scripts):
       1. pick a live egg (parts tagged "BreakableEgg", in Build.ZoneBuilds.ZoneN.Eggs)
-      2. fling TP next to it, hold the Pickaxe, fire EggHitRequest(egg, hitId) once per swing
-      3. the broken egg drops an animal in workspace.AnimalPickups (same "HatchId")
-      4. fling TP to it and trigger its StealPrompt (CarryCount goes up)
-      5. stay flung while going back, stop flinging just OUTSIDE your plot's Hitbox,
-         then walk in so the game banks it (it banks inside your Hitbox or the SafeZone)
+      2. hidden TP next to it, wait 1 s, unhide, walk out of dig reach and back
+      3. mine it: EggHitRequest(egg, hitId) once per swing, Pickaxe held (game's Auto Swing kept off)
+      4. it turns "Hatching"; after the hatch animation the game spawns its animal (same HatchId)
+      5. hidden TP to it, trigger its StealPrompt (CarryCount goes up)
+      6. hidden all the way back, unhide just OUTSIDE your plot's Hitbox, walk in to bank
 ]]
 
 local ENV = (getgenv and getgenv()) or _G
@@ -47,6 +49,7 @@ end
 local CONFIG_FILE = "SmurfySimple_BreakStealEgg.json"
 local Defaults = {
     Zone = 0,            -- 0 = any zone, else 1-9
+    Method = "Ghost",    -- "Ghost" (far CFrame) or "Fling" (huge velocity)
     FlingLevel = 4,      -- index into FlingPowers (Max)
     BankEachGrab = true, -- go home after every animal (off = fill the satchel first)
     WalkInToBank = true, -- after landing outside the plot, walk in to bank
@@ -118,82 +121,154 @@ local function groundBelow(pos)
     return ok and hit and hit.Position or nil
 end
 
----------------------------------------------------------------- fling engine
-local Fling = { On = false, Hold = nil, Conns = {} }
+---------------------------------------------------------------- movers (fling / ghost)
+-- Both hide where you really are from the server / other players, while on your own
+-- screen you stand still on a "hold" CFrame:
+--   Fling: after physics (Heartbeat) the velocity is set huge -> you look flung away.
+--   Ghost: after physics the CFrame is moved 9e9 studs away -> the server sees you far away.
+-- Before the next physics step and before drawing (Stepped / RenderStepped) the character is
+-- put back on the hold point with no velocity. A TP just moves the hold point (one frame).
 
 local function zeroMotion(root)
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
 end
 
--- pin the character to the hold point and kill its motion (runs before physics and before render)
-local function pin()
-    local root = getRoot()
-    if not root then return end
-    zeroMotion(root)
-    if Fling.Hold then root.CFrame = Fling.Hold end
-end
+local WARMUP = 0.15 -- seconds hidden in place before the jump, so the jump itself is never seen
+local SETTLE = 0.1  -- seconds hidden on arrival before doing anything there
+local GHOST_FAR = CFrame.new(9e9, 0, 9e9)
 
-function Fling.Start(hold)
-    local root = getRoot()
-    Fling.Hold = hold or (root and root.CFrame) or Fling.Hold
-    if Fling.On then return end
-    Fling.On = true
-    Fling.Since = os.clock()
-    -- after physics: this is what replicates -> flung out of the universe
-    table.insert(Fling.Conns, RunService.Heartbeat:Connect(function()
-        local r = getRoot()
-        if not r then return end
-        local power = (FlingPowers[Settings.FlingLevel] or FlingPowers[#FlingPowers])[2]
-        r.AssemblyLinearVelocity = Vector3.new(power, power, power)
-        r.AssemblyAngularVelocity = Vector3.new(0, power, 0)
-    end))
-    -- before physics and before drawing: stand still on the hold point
-    table.insert(Fling.Conns, RunService.Stepped:Connect(pin))
-    table.insert(Fling.Conns, RunService.RenderStepped:Connect(pin))
-end
+local leavePlot -- defined with the plot helpers: walks off your plot if you're on it
 
-function Fling.Stop()
-    for _, c in ipairs(Fling.Conns) do c:Disconnect() end
-    table.clear(Fling.Conns)
-    local wasOn = Fling.On
-    Fling.On = false
-    Fling.Hold = nil
-    local root = getRoot()
-    if root and wasOn then zeroMotion(root) end
-end
+local function newMover(name, afterPhysics)
+    local M = { Name = name, On = false, Hold = nil, Conns = {} }
 
--- the "teleport": keep flinging and move the hold point there in hops
-local WARMUP = 0.15 -- seconds flung in place before the jump, so the jump itself is never seen
-local SETTLE = 0.1  -- seconds flung on arrival before doing anything there
+    -- back on the hold point, no motion (before physics and before drawing)
+    local function pin()
+        local root = getRoot()
+        if not root then return end
+        zeroMotion(root)
+        if M.Hold then root.CFrame = M.Hold end
+        M.Away = false
+    end
 
-local leavePlot -- defined with the plot helpers: steps out of your plot (no fling) if you're on it
+    function M.Start(hold)
+        local root = getRoot()
+        M.Hold = hold or (root and root.CFrame) or M.Hold
+        if M.On then return end
+        M.On = true
+        M.Since = os.clock()
+        M.Root = root
+        -- after physics: what replicates
+        table.insert(M.Conns, RunService.Heartbeat:Connect(function()
+            local r = getRoot()
+            if not r then return end
+            M.Root = r
+            afterPhysics(r, M)
+        end))
+        table.insert(M.Conns, RunService.Stepped:Connect(pin))
+        table.insert(M.Conns, RunService.RenderStepped:Connect(pin))
+    end
 
-function Fling.TP(target)
-    local root = getRoot()
-    if not root then return false end
-    if not Fling.On then
-        -- never fling while on the plot: step outside it first
-        if leavePlot then leavePlot() end
-        root = getRoot()
+    function M.Stop()
+        for _, c in ipairs(M.Conns) do c:Disconnect() end
+        table.clear(M.Conns)
+        local wasOn = M.On
+        M.On = false
+        local root = getRoot()
+        if root and wasOn then
+            zeroMotion(root)
+            if M.Away and M.Hold then root.CFrame = M.Hold end
+        end
+        M.Away = false
+        M.Hold = nil
+        return wasOn
+    end
+
+    -- the "teleport": hidden for a moment, then the whole trip in ONE frame.
+    -- Only the hold point moves; the pin applies it before physics
+    function M.TP(target)
+        local root = getRoot()
         if not root then return false end
-        Fling.Start(root.CFrame)
-    end
-    -- already flung for a moment, then the whole trip in ONE frame (looks like a teleport).
-    -- Only the hold point moves: the Stepped / RenderStepped pin applies it before physics,
-    -- so the flung velocity set after physics is never touched here
-    local t = os.clock()
-    while Fling.On and App.Alive and os.clock() - (Fling.Since or t) < WARMUP do
+        if not M.On then
+            -- never hidden while on the plot: walk off it first
+            if leavePlot then leavePlot() end
+            root = getRoot()
+            if not root then return false end
+            M.Start(root.CFrame)
+        end
+        local t = os.clock()
+        while M.On and App.Alive and os.clock() - (M.Since or t) < WARMUP do
+            RunService.Stepped:Wait()
+        end
+        if not App.Alive or not M.On then return false end
+        M.Hold = target
         RunService.Stepped:Wait()
+        t = os.clock()
+        while M.On and App.Alive and os.clock() - t < SETTLE do
+            RunService.Stepped:Wait()
+        end
+        return M.On
     end
-    if not App.Alive or not Fling.On then return false end
-    Fling.Hold = target
-    RunService.Stepped:Wait()
-    t = os.clock()
-    while Fling.On and App.Alive and os.clock() - t < SETTLE do
-        RunService.Stepped:Wait()
+
+    return M
+end
+
+local Fling = newMover("Fling", function(r)
+    local power = (FlingPowers[Settings.FlingLevel] or FlingPowers[#FlingPowers])[2]
+    r.AssemblyLinearVelocity = Vector3.new(power, power, power)
+    r.AssemblyAngularVelocity = Vector3.new(0, power, 0)
+end)
+
+local Ghost = newMover("Ghost", function(r, M)
+    M.Away = true
+    r.CFrame = (M.Hold or r.CFrame) * GHOST_FAR
+end)
+
+-- while ghosting, the game's own scripts (not this one) read your real spot, not 9e9
+local hookOriginal
+local function installGhostHook()
+    if hookOriginal or type(hookmetamethod) ~= "function" or type(newcclosure) ~= "function"
+        or type(checkcaller) ~= "function" then return end
+    pcall(function()
+        hookOriginal = hookmetamethod(game, "__index", newcclosure(function(self, key)
+            if Ghost.On and Ghost.Hold and (key == "CFrame" or key == "Position") and self == Ghost.Root
+                and not checkcaller() then
+                return key == "CFrame" and Ghost.Hold or Ghost.Hold.Position
+            end
+            return hookOriginal(self, key)
+        end))
+    end)
+end
+local function removeGhostHook()
+    if hookOriginal then
+        pcall(hookmetamethod, game, "__index", hookOriginal)
+        hookOriginal = nil
     end
-    return Fling.On
+end
+local ghostStart = Ghost.Start
+function Ghost.Start(hold)
+    installGhostHook()
+    ghostStart(hold)
+end
+
+-- the method picked in the UI
+local function Mover() return Settings.Method == "Fling" and Fling or Ghost end
+local function hidden() return Fling.On or Ghost.On end
+local function stopMovers()
+    Fling.Stop()
+    Ghost.Stop()
+end
+-- stop hiding; after a ghost wait until the server has your real spot again
+local function unhide()
+    local wasGhost = Ghost.Stop()
+    Fling.Stop()
+    if wasGhost then task.wait(0.2) end
+end
+local function moverTP(target)
+    local m = Mover()
+    if (m == Fling and Ghost.On) or (m == Ghost and Fling.On) then stopMovers() end
+    return m.TP(target)
 end
 
 ---------------------------------------------------------------- game: places
@@ -543,7 +618,7 @@ end
 
 -- stop flinging, walk out of dig reach, walk back next to the egg
 local function walkOutAndBack(egg, token)
-    Fling.Stop()
+    unhide()
     local root = getRoot()
     if not root then return false end
     local dir = flat(root.Position - egg.Position)
@@ -567,18 +642,21 @@ end
 -- break one egg. true when it broke (the game marks it Hatching / Broken)
 local function breakEgg(egg, token)
     status("Going to " .. (egg.Parent and egg.Parent.Name or "egg"))
-    if not Fling.TP(besideEgg(egg)) then return false end
+    if not moverTP(besideEgg(egg)) then return false end
     keepAutoSwingOff()
     equipPickaxe()
     -- arrived: hold still (flung) for a second before anything else
     local arrived = os.clock()
     while running(token) and isLive(egg) and os.clock() - arrived < SWING_DELAY do
-        Fling.Hold = besideEgg(egg)
+        local m = Mover()
+        if m.On then m.Hold = besideEgg(egg) end
         task.wait(0.1)
     end
     if Settings.WalkOutFirst then
         if not walkOutAndBack(egg, token) then return eggBroke(egg) end
     end
+    -- the server must see you next to the egg to count hits: no ghost while mining
+    if Ghost.On then unhide() end
     status("Mining " .. (egg.Parent and egg.Parent.Name or "egg"))
     local lastHp, lastChange = num(egg, "Health", 0), os.clock()
     local cooldown = swingCooldown()
@@ -624,7 +702,9 @@ local function grabAnimal(hatchId, eggPos, token)
                 local dir = root and flat(root.Position - pos) or Vector3.zero
                 dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(1, 0, 0)
                 local stand = pos + dir * 3
-                Fling.TP(CFrame.lookAt(stand, Vector3.new(pos.X, stand.Y, pos.Z)))
+                moverTP(CFrame.lookAt(stand, Vector3.new(pos.X, stand.Y, pos.Z)))
+                -- the server must see you next to the animal: no ghost while grabbing
+                if Ghost.On then unhide() end
                 firePrompt(prompt)
                 local w = os.clock()
                 while os.clock() - w < 0.8 and carrying() <= before and animal.Parent do task.wait(0.1) end
@@ -645,14 +725,14 @@ local function goHome(token)
         task.wait(1)
         return false
     end
-    status("Flinging home (outside the plot)")
-    Fling.TP(spot)
+    status(Mover().Name .. " home (outside the plot)")
+    moverTP(spot)
     task.wait(0.25)
     local hum = getHumanoid()
     -- start walking in on the same frame the fling ends
     local walk = Settings.WalkInToBank and carrying() > 0
     if walk and hum then pcall(hum.MoveTo, hum, plotWalkTarget(hb)) end
-    Fling.Stop()
+    stopMovers()
     if carrying() == 0 then return true end
     if not walk then
         status("Outside your plot. Walk in to bank")
@@ -675,7 +755,7 @@ end
 
 local function farmStep(token)
     if not alive() then
-        Fling.Stop()
+        stopMovers()
         status("Waiting for your character")
         task.wait(1)
         return
@@ -723,7 +803,7 @@ end
 function Farm.Stop()
     Farm.On = false
     Farm.Token += 1
-    Fling.Stop()
+    stopMovers()
     status("Idle")
 end
 
@@ -1004,7 +1084,7 @@ local unload -- defined below
 
 button(mainPage, "Restore settings", Theme.Item, function()
     Farm.Stop()
-    Fling.Stop()
+    stopMovers()
     Settings = table.clone(Defaults)
     table.clear(Skip)
     pcall(function() if type(delfile) == "function" and isfile(CONFIG_FILE) then delfile(CONFIG_FILE) end end)
@@ -1026,8 +1106,17 @@ setStatus = function(text)
 end
 setStatus("Idle")
 
-toggle(testPage, "Auto farm (fling)", function() return Farm.On end, function(v)
+toggle(testPage, "Auto farm", function() return Farm.On end, function(v)
     if v then Farm.Start() else Farm.Stop() end
+end)
+
+cycle(testPage, function()
+    return "Method: " .. (Settings.Method == "Fling" and "Fling (huge speed)" or "Ghost (far away)")
+end, function()
+    stopMovers()
+    Settings.Method = Settings.Method == "Fling" and "Ghost" or "Fling"
+    saveSettings()
+    refreshAll()
 end)
 
 cycle(testPage, function()
@@ -1062,33 +1151,33 @@ end)
 
 label(testPage, "<b>Manual tests</b>")
 
-toggle(testPage, "Fling in place (stand still)", function() return Fling.On end, function(v)
+toggle(testPage, "Hide in place (stand still)", hidden, function(v)
     if v then
         leavePlot() -- not on the plot
-        Fling.Start()
+        Mover().Start()
     else
-        Fling.Stop()
+        stopMovers()
     end
-    status(v and "Flinging in place" or "Idle")
+    status(v and (Mover().Name .. " in place") or "Idle")
 end)
 
-button(testPage, "Fling TP → nearest egg", nil, function()
+button(testPage, "TP → nearest egg", nil, function()
     local egg = pickEgg()
     if not egg then return status("No egg found") end
     task.spawn(function()
-        Fling.TP(besideEgg(egg))
-        status("Holding next to the egg (still flinging)")
+        moverTP(besideEgg(egg))
+        status("Holding next to the egg (still hidden)")
         refreshAll()
     end)
 end)
 
-button(testPage, "Fling TP → outside my plot", nil, function()
+button(testPage, "TP → outside my plot", nil, function()
     local spot = outsidePlotCFrame()
     if not spot then return status("Can't find your plot") end
     task.spawn(function()
-        Fling.TP(spot)
+        moverTP(spot)
         task.wait(0.25)
-        Fling.Stop()
+        stopMovers()
         status("Outside your plot")
         refreshAll()
     end)
@@ -1113,7 +1202,7 @@ task.spawn(function()
 end)
 
 track(LocalPlayer.CharacterAdded:Connect(function()
-    if Fling.On then Fling.Stop() end
+    stopMovers()
     refreshAll()
 end))
 
@@ -1122,7 +1211,8 @@ unload = function()
     if not App.Alive then return end
     App.Alive = false
     Farm.Stop()
-    Fling.Stop()
+    stopMovers()
+    removeGhostHook()
     for _, c in ipairs(App.Conns) do pcall(function() c:Disconnect() end) end
     table.clear(App.Conns)
     pcall(function() gui:Destroy() end)

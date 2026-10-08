@@ -137,7 +137,7 @@ remotes.EggHitRequest.__server = function(egg, id)
     if os.clock() - lastHit < 0.5 * 0.92 then SG.fastHits += 1 return end
     lastHit = os.clock()
     if not char:FindFirstChild("Pickaxe") then SG.unheldHits += 1 return end
-    local rel = root.Position - egg.Position
+    local rel = (SG.serverPos or root.Position) - egg.Position
     local flatDist = math.max(Vector3.new(rel.X, 0, rel.Z).Magnitude - 2, 0)
     local vertical = math.max(math.abs(rel.Y) - 2.5, 0)
     if math.sqrt(flatDist * flatDist + vertical * vertical) > 8.3 then SG.farHits += 1 return end
@@ -169,7 +169,7 @@ end
 function fireproximityprompt(prompt)
     local m = prompt.__pickup
     if not m or not m.Parent or not prompt.Enabled then return end
-    if (root.Position - m.__pivot).Magnitude > 10 then table.insert(SG.log, "prompt too far") return end
+    if ((SG.serverPos or root.Position) - m.__pivot).Magnitude > 10 then table.insert(SG.log, "prompt too far") return end
     local count = lp:GetAttribute("CarryCount")
     if count >= lp:GetAttribute("SatchelCapacity") then return end
     m.Parent = nil
@@ -187,54 +187,61 @@ local function inHitbox(pos)
 end
 
 -- server view after Heartbeat: flung or not, where
+-- what replicates: the root's CFrame and velocity right after Heartbeat
 local hb = rs.__signals.Heartbeat
 local fire = hb.Fire
 hb.Fire = function(self, ...)
     fire(self, ...)
-    local v = root.AssemblyLinearVelocity
-    local flung = v ~= nil and v.Magnitude > 1000
-    -- big jumps: must be one frame, flung before and during (looks like a teleport)
-    local pos = root.Position
-    if SG.prevPos and (pos - SG.prevPos).Magnitude > 20 then
-        SG.jumps = (SG.jumps or 0) + 1
-        if not (flung and SG.lastFlung) then
-            SG.unflungJumps = (SG.unflungJumps or 0) + 1
-            table.insert(SG.log, ("unflung jump %.0f studs"):format((pos - SG.prevPos).Magnitude))
-        end
-        if SG.prevJumpFrame == SG.frame - 1 then SG.multiFrameTrips = (SG.multiFrameTrips or 0) + 1 end
-        SG.prevJumpFrame = SG.frame
-    end
-    SG.prevPos = pos
-    SG.frame = (SG.frame or 0) + 1
-    if v then SG.maxSpeed = math.max(SG.maxSpeed or 0, v.Magnitude) end
-    SG.lastFlung = flung
-    if flung then
-        SG.flungFrames += 1
-        if inHitbox(root.Position) then SG.flungOnPlot += 1 end
-    end
+    SG.serverPos = root.Position
+    SG.serverVel = root.AssemblyLinearVelocity
 end
 
 local runFrames = __runFrames
 function __runFrames(n)
     for _ = 1, n do
         runFrames(1)
+        -- this frame, as the server saw it: flung (huge speed) or ghosted (far from where you are)
+        local real = root.Position
+        local v = SG.serverVel
+        local flung = v ~= nil and v.Magnitude > 1000
+        local ghosted = SG.serverPos ~= nil and (SG.serverPos - real).Magnitude > 1e5
+        local hiddenNow = flung or ghosted
+        if v then SG.maxSpeed = math.max(SG.maxSpeed or 0, v.Magnitude) end
+        if ghosted then SG.ghostFrames = (SG.ghostFrames or 0) + 1 end
+        -- big jumps: one frame, hidden the frame before and during (looks like a teleport)
+        if SG.prevPos and (real - SG.prevPos).Magnitude > 20 then
+            SG.jumps = (SG.jumps or 0) + 1
+            if not (hiddenNow and SG.lastFlung) then
+                SG.unflungJumps = (SG.unflungJumps or 0) + 1
+                table.insert(SG.log, ("visible jump %.0f studs"):format((real - SG.prevPos).Magnitude))
+            end
+            if SG.prevJumpFrame == SG.frame - 1 then SG.multiFrameTrips = (SG.multiFrameTrips or 0) + 1 end
+            SG.prevJumpFrame = SG.frame
+        end
+        SG.prevPos = real
+        SG.frame = (SG.frame or 0) + 1
+        SG.lastFlung = hiddenNow
+        if hiddenNow then
+            SG.flungFrames += 1
+            if inHitbox(real) then SG.flungOnPlot += 1 end
+        end
         -- when the character first gets within hit range of each egg
         for _, egg in ipairs(SG.eggs or {}) do
             if egg.Parent and not egg.__arrived then
-                local rel = root.Position - egg.Position
+                local rel = real - egg.Position
                 if Vector3.new(rel.X, 0, rel.Z).Magnitude < 8 and math.abs(rel.Y) < 5 then egg.__arrived = os.clock() end
             end
-            -- walked (not flung) out of dig reach after arriving
-            if egg.Parent and egg.__arrived and not egg.__wentOut and not SG.lastFlung then
-                local rel = root.Position - egg.Position
+            -- walked (not hidden) out of dig reach after arriving
+            if egg.Parent and egg.__arrived and not egg.__wentOut and not hiddenNow then
+                local rel = real - egg.Position
                 local h = math.max(Vector3.new(rel.X, 0, rel.Z).Magnitude - 2, 0)
-                local v = math.max(math.abs(rel.Y) - 2.5, 0)
-                if math.sqrt(h * h + v * v) > 8.3 then egg.__wentOut = os.clock() end
+                local vv = math.max(math.abs(rel.Y) - 2.5, 0)
+                if math.sqrt(h * h + vv * vv) > 8.3 then egg.__wentOut = os.clock() end
             end
         end
-        -- while flinging, the client must look still: no drift between frames except hold moves
-        local v = root.AssemblyLinearVelocity
-        if SG.lastFlung and v and v.Magnitude > 0 then SG.notStillFrames = (SG.notStillFrames or 0) + 1 end
+        -- while hidden, the client must look still: velocity zeroed before physics
+        local cv = root.AssemblyLinearVelocity
+        if hiddenNow and cv and cv.Magnitude > 0 then SG.notStillFrames = (SG.notStillFrames or 0) + 1 end
         if walkTarget then
             local d = Vector3.new(walkTarget.X - root.Position.X, 0, walkTarget.Z - root.Position.Z)
             if d.Magnitude > 0.5 then
@@ -244,14 +251,15 @@ function __runFrames(n)
                 walkTarget = nil
             end
         end
-        if lp:GetAttribute("CarryCount") > 0 and inHitbox(root.Position) then
-            if SG.lastFlung then SG.bankedWhileFlung += 1 end
+        -- banking is decided by the server, from the replicated position
+        if lp:GetAttribute("CarryCount") > 0 and SG.serverPos and inHitbox(SG.serverPos) then
+            if hiddenNow then SG.bankedWhileFlung += 1 end
             SG.banked += lp:GetAttribute("CarryCount")
             table.insert(SG.log, "banked " .. lp:GetAttribute("CarryCount"))
             lp:SetAttribute("CarryCount", 0)
         end
-        -- carrying, not flung, outside the plot and not walking home = exposed to the guard
-        if lp:GetAttribute("CarryCount") > 0 and not SG.lastFlung and not inHitbox(root.Position) and not walkTarget then
+        -- carrying, not hidden, outside the plot and not walking home = exposed to the guard
+        if lp:GetAttribute("CarryCount") > 0 and not hiddenNow and not inHitbox(real) and not walkTarget then
             SG.carriedUnflungOutside += 1
         end
     end
