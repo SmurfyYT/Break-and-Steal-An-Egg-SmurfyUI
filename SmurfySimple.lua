@@ -55,6 +55,10 @@ local Defaults = {
     UnderSpeed = 300,
     WindowX = 80,
     WindowY = 80,
+    PinX = false,  -- pinned target position (false = none)
+    PinY = false,
+    PinZ = false,
+    PinSpeed = 500,
 }
 local FlingPowers = { { "High", 5e3 }, { "Very high", 5e4 }, { "Out of the universe", 5e5 }, { "Max", 1e6 } }
 local Settings = table.clone(Defaults)
@@ -70,7 +74,11 @@ local function loadSettings()
         if not isfile(CONFIG_FILE) then return end
         local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
         for k, v in pairs(data) do
-            if Defaults[k] ~= nil and type(v) == type(Defaults[k]) then Settings[k] = v end
+            if Defaults[k] ~= nil then
+                if type(v) == type(Defaults[k]) then Settings[k] = v
+                elseif (k == "PinX" or k == "PinY" or k == "PinZ") and type(v) == "number" then Settings[k] = v
+                end
+            end
         end
     end)
 end
@@ -1000,6 +1008,59 @@ runStop(methodsPage, "Run showdown", methodsOut, function(token, out)
     end
     render("ok = stayed, BACK = pulled back, -- = no ground\nDone.")
 end)
+
+---------------- Methods: pinned target
+do
+    local pinOut = resultsBox(methodsPage)
+    local pinLabel -- forward ref so the cycle can refresh
+
+    local function pinDesc()
+        if Settings.PinX then
+            return ("Pin: %.1f, %.1f, %.1f"):format(Settings.PinX, Settings.PinY, Settings.PinZ)
+        end
+        return "Pin: not set — stand at your target and press Set"
+    end
+
+    pinLabel = cycle(methodsPage, pinDesc, function() end)  -- display only
+
+    button(methodsPage, "Set pin here", Theme.Item, function()
+        local root = getRoot()
+        if not root then pinOut("No character.") return end
+        local p = root.Position
+        Settings.PinX, Settings.PinY, Settings.PinZ = p.X, p.Y, p.Z
+        saveSettings()
+        pinLabel()  -- refresh the cycle label
+        pinOut("Pinned at " .. ("%0.1f, %0.1f, %0.1f"):format(p.X, p.Y, p.Z))
+    end)
+
+    pickCycle(methodsPage, "Speed: ", "PinSpeed", { 200, 500, 1000, 2000 }, function(v) return v .. " studs/s" end)
+
+    runStop(methodsPage, "Velocity to pin", pinOut, function(token, out)
+        if not Settings.PinX then out("No pin set. Stand at your target and press Set pin here.") return end
+        local target = CFrame.new(Settings.PinX, Settings.PinY, Settings.PinZ)
+        local root = getRoot()
+        if not root then out("No character.") return end
+        local dist = (root.Position - target.Position).Magnitude
+        out(("Going %.0f studs to pin via Velocity..."):format(dist))
+        markOwn(dist / Settings.PinSpeed + 1)
+        local dir = (target.Position - root.Position)
+        if dir.Magnitude < 0.1 then out("Already there.") return end
+        zeroMotion(root)
+        root.AssemblyLinearVelocity = dir.Unit * Settings.PinSpeed
+        local t0 = os.clock()
+        local limit = dist / Settings.PinSpeed + 1
+        while labRunning(token) and os.clock() - t0 < limit do
+            local r2 = getRoot()
+            if not r2 then break end
+            if (r2.Position - target.Position).Magnitude < 5 then break end
+            RunService.Stepped:Wait()
+        end
+        local r2 = getRoot()
+        if r2 then zeroMotion(r2) end
+        local r = watch(target, root.CFrame, token)
+        out(("Velocity to pin %.0f studs: %s"):format(dist, describe(r)))
+    end)
+end
 
 ---------------- Warmup
 label(warmupPage, "<b>Warmup tuner</b>: how long you're hidden before the jump. Tries none, 1 frame, 0.05, 0.15 and 0.5 s (2 tries each) and keeps the shortest that always worked.")
