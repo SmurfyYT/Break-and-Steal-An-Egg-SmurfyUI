@@ -499,12 +499,20 @@ local function travel(method, target, token, opts)
     elseif method == "Glide" then
         glidePath({ root.Position, target.Position }, opts.speed or 300, token)
     elseif method == "Velocity" then
-        -- raw AssemblyLinearVelocity: re-aim every frame so gravity never accumulates
+        -- LinearVelocity constraint with huge MaxForce overrides humanoid + gravity
         local dist = (target.Position - root.Position).Magnitude
         if dist < 0.1 then return labRunning(token) end
         local speed = opts.speed or math.clamp(dist / 0.4, 50, 2000)
         markOwn(dist / speed + 0.5)
         noclip(true)
+        local att = Instance.new("Attachment")
+        att.Parent = root
+        local lv = Instance.new("LinearVelocity")
+        lv.Attachment0 = att
+        lv.RelativeTo = Enum.ActuatorRelativeTo.World
+        lv.MaxForce = 1e6
+        lv.VectorVelocity = (target.Position - root.Position).Unit * speed
+        lv.Parent = root
         local t0 = os.clock()
         local limit = dist / speed + 0.5
         while labRunning(token) and os.clock() - t0 < limit do
@@ -512,10 +520,10 @@ local function travel(method, target, token, opts)
             if not r2 then break end
             local remaining = target.Position - r2.Position
             if remaining.Magnitude < 4 then break end
-            r2.AssemblyAngularVelocity = Vector3.zero
-            r2.AssemblyLinearVelocity = remaining.Unit * speed
+            lv.VectorVelocity = remaining.Unit * speed  -- re-aim each frame
             RunService.Stepped:Wait()
         end
+        pcall(function() lv:Destroy() att:Destroy() end)
         noclip(false)
         local r2 = getRoot()
         if r2 then zeroMotion(r2) end
@@ -1016,6 +1024,14 @@ do
         local dir = (target.Position - root.Position)
         if dir.Magnitude < 0.1 then out("Already there.") return end
         noclip(true)
+        local att = Instance.new("Attachment")
+        att.Parent = root
+        local lv = Instance.new("LinearVelocity")
+        lv.Attachment0 = att
+        lv.RelativeTo = Enum.ActuatorRelativeTo.World
+        lv.MaxForce = 1e6
+        lv.VectorVelocity = dir.Unit * Settings.PinSpeed
+        lv.Parent = root
         local t0 = os.clock()
         local limit = dist / Settings.PinSpeed + 1
         while labRunning(token) and os.clock() - t0 < limit do
@@ -1023,11 +1039,10 @@ do
             if not r2 then break end
             local remaining = target.Position - r2.Position
             if remaining.Magnitude < 5 then break end
-            -- re-aim every frame so gravity never accumulates
-            r2.AssemblyAngularVelocity = Vector3.zero
-            r2.AssemblyLinearVelocity = remaining.Unit * Settings.PinSpeed
+            lv.VectorVelocity = remaining.Unit * Settings.PinSpeed
             RunService.Stepped:Wait()
         end
+        pcall(function() lv:Destroy() att:Destroy() end)
         noclip(false)
         local r2 = getRoot()
         if r2 then zeroMotion(r2) end
