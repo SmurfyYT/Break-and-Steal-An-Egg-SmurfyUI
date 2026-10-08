@@ -40,7 +40,10 @@ end
 -- manual: fling in place keeps you still
 check(__inHitbox(__root.Position), "test starts on the plot")
 click("Fling in place")
-check(not __inHitbox(__root.Position), "fling in place steps off the plot first")
+__runFrames(60 * 5) -- walks off the plot first
+check(not __inHitbox(__root.Position), "fling in place walks off the plot first")
+check((__SG.unflungJumps or 0) == 0, "...walking, not a visible step")
+__SG.flungFrames = 0
 local startPos = __root.Position
 __runFrames(120)
 check(__SG.flungFrames >= 100, "fling in place sends a flung character (" .. __SG.flungFrames .. " frames)")
@@ -72,6 +75,11 @@ check(__SG.broken == 3, "all 3 zone-1 eggs broken (" .. __SG.broken .. ")")
 check((__SG.earlyHits or 0) == 0, "waits 1 second next to each egg before swinging (" .. (__SG.earlyHits or 0) .. " early hits)")
 check((__SG.flungHits or 0) == 0, "mines without the fling (" .. (__SG.flungHits or 0) .. " flung hits)")
 check((__SG.noWalkOutHits or 0) == 0, "walks out of dig reach and back before mining (" .. (__SG.noWalkOutHits or 0) .. " hits without)")
+check((__SG.jumps or 0) >= 6, "trips happened as jumps (" .. (__SG.jumps or 0) .. ")")
+check((__SG.unflungJumps or 0) == 0, "every jump is flung the frame before and the frame of it (" .. (__SG.unflungJumps or 0) .. " not)")
+check((__SG.multiFrameTrips or 0) == 0, "each trip is a single-frame jump, no visible hops (" .. (__SG.multiFrameTrips or 0) .. ")")
+check((__SG.maxSpeed or 0) >= 1e6, ("Max fling power by default (%.0f)"):format(__SG.maxSpeed or 0))
+check(buttonStarting("Fling power: Max") ~= nil, "power button shows Max")
 check(__SG.fastHits == 0, "never hit faster than the swing cooldown (" .. __SG.fastHits .. ")")
 check(__SG.farHits == 0, "every hit in range (" .. __SG.farHits .. " too far)")
 check(__SG.unheldHits == 0, "pickaxe always held (" .. __SG.unheldHits .. ")")

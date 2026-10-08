@@ -47,14 +47,14 @@ end
 local CONFIG_FILE = "SmurfySimple_BreakStealEgg.json"
 local Defaults = {
     Zone = 0,            -- 0 = any zone, else 1-9
-    FlingPower = 2,      -- index into FlingPowers
+    FlingLevel = 4,      -- index into FlingPowers (Max)
     BankEachGrab = true, -- go home after every animal (off = fill the satchel first)
     WalkInToBank = true, -- after landing outside the plot, walk in to bank
     WalkOutFirst = true, -- at the egg: stop flinging, walk out of dig reach and back, then mine
     WindowX = 80,
     WindowY = 80,
 }
-local FlingPowers = { { "High", 5e3 }, { "Very high", 5e4 }, { "Out of the universe", 5e5 } }
+local FlingPowers = { { "High", 5e3 }, { "Very high", 5e4 }, { "Out of the universe", 5e5 }, { "Max", 1e6 } }
 local Settings = table.clone(Defaults)
 
 local function saveSettings()
@@ -139,11 +139,12 @@ function Fling.Start(hold)
     Fling.Hold = hold or (root and root.CFrame) or Fling.Hold
     if Fling.On then return end
     Fling.On = true
+    Fling.Since = os.clock()
     -- after physics: this is what replicates -> flung out of the universe
     table.insert(Fling.Conns, RunService.Heartbeat:Connect(function()
         local r = getRoot()
         if not r then return end
-        local power = (FlingPowers[Settings.FlingPower] or FlingPowers[2])[2]
+        local power = (FlingPowers[Settings.FlingLevel] or FlingPowers[#FlingPowers])[2]
         r.AssemblyLinearVelocity = Vector3.new(power, power, power)
         r.AssemblyAngularVelocity = Vector3.new(0, power, 0)
     end))
@@ -163,7 +164,9 @@ function Fling.Stop()
 end
 
 -- the "teleport": keep flinging and move the hold point there in hops
-local HOP = 150
+local WARMUP = 0.15 -- seconds flung in place before the jump, so the jump itself is never seen
+local SETTLE = 0.1  -- seconds flung on arrival before doing anything there
+
 local leavePlot -- defined with the plot helpers: steps out of your plot (no fling) if you're on it
 
 function Fling.TP(target)
@@ -176,18 +179,20 @@ function Fling.TP(target)
         if not root then return false end
         Fling.Start(root.CFrame)
     end
-    local from = (Fling.Hold or root.CFrame).Position
-    local dist = (target.Position - from).Magnitude
-    local hops = math.max(1, math.ceil(dist / HOP))
-    -- only move the hold point: the Stepped / RenderStepped pin applies it before
-    -- physics, so the flung velocity set after physics is never touched here
-    for i = 1, hops do
-        if not App.Alive or not Fling.On then return false end
-        Fling.Hold = target.Rotation + from:Lerp(target.Position, i / hops)
+    -- already flung for a moment, then the whole trip in ONE frame (looks like a teleport).
+    -- Only the hold point moves: the Stepped / RenderStepped pin applies it before physics,
+    -- so the flung velocity set after physics is never touched here
+    local t = os.clock()
+    while Fling.On and App.Alive and os.clock() - (Fling.Since or t) < WARMUP do
         RunService.Stepped:Wait()
     end
+    if not App.Alive or not Fling.On then return false end
     Fling.Hold = target
     RunService.Stepped:Wait()
+    t = os.clock()
+    while Fling.On and App.Alive and os.clock() - t < SETTLE do
+        RunService.Stepped:Wait()
+    end
     return Fling.On
 end
 
@@ -248,9 +253,21 @@ leavePlot = function()
     if not hb or not root or not inPart(hb, root.Position) then return end
     local spot = outsidePlotCFrame()
     if not spot then return end
-    zeroMotion(root)
-    root.CFrame = spot
-    RunService.Stepped:Wait()
+    -- walk off the plot (a step would look like a teleport); snap only if stuck
+    local hum = getHumanoid()
+    local t = os.clock()
+    while App.Alive and os.clock() - t < 6 do
+        local r = getRoot()
+        if not r or not inPart(hb, r.Position) then break end
+        if hum then pcall(hum.MoveTo, hum, spot.Position) end
+        task.wait(0.1)
+    end
+    root = getRoot()
+    if root and inPart(hb, root.Position) then
+        zeroMotion(root)
+        root.CFrame = spot
+        RunService.Stepped:Wait()
+    end
 end
 
 local function plotWalkTarget(hb)
@@ -648,6 +665,9 @@ local function goHome(token)
         if hum then pcall(hum.MoveTo, hum, plotWalkTarget(hb)) end
         task.wait(0.25)
     end
+    -- banked: stop walking (stay near the edge of the plot)
+    local r = getRoot()
+    if hum and r then pcall(hum.MoveTo, hum, r.Position) end
     local banked = carried - carrying()
     if banked > 0 then Farm.Stats.Banked += banked end
     return carrying() == 0
@@ -1019,9 +1039,9 @@ end, function()
 end)
 
 cycle(testPage, function()
-    return "Fling power: " .. (FlingPowers[Settings.FlingPower] or FlingPowers[2])[1]
+    return "Fling power: " .. (FlingPowers[Settings.FlingLevel] or FlingPowers[#FlingPowers])[1]
 end, function()
-    Settings.FlingPower = Settings.FlingPower % #FlingPowers + 1
+    Settings.FlingLevel = Settings.FlingLevel % #FlingPowers + 1
     saveSettings()
 end)
 

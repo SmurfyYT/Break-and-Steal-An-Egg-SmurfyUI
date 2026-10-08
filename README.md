@@ -18,7 +18,7 @@
   The game's own **Auto Swing** button is kept off (turned off on load and whenever it gets switched on);
   the farm sends its own hits.
 - **Zone**: Any (nearest egg) or 1-9.
-- **Fling power**: how hard the character looks flung to everyone else.
+- **Fling power**: how hard the character looks flung to everyone else (High → Max, default Max).
 - **Bank after every grab** (off = fill the satchel first), **Walk in to bank**.
 - Manual tests: **Fling in place**, **Fling TP → nearest egg**, **Fling TP → outside my plot**.
 
@@ -26,8 +26,9 @@
 Every frame, right after physics (Heartbeat), the character's velocity is set to a huge value. That's
 what the server and other players get, so you look flung out of the map. Before the next physics step
 (Stepped / RenderStepped) the velocity is zeroed and you're pinned to a hold point, so on your screen
-you stand still and can hit eggs and press prompts. Teleporting moves that hold point in hops while
-the fling stays on. It never flings you on your own plot: you're stepped just outside it first.
+you stand still and can hit eggs and press prompts. Teleporting: you're flung in place for 0.15 s,
+then the hold point jumps to the target in a single frame, so it looks like a teleport. Fling power
+defaults to **Max**. It never flings you on your own plot: you walk just off it first.
 
 ## Tests
 ```bash

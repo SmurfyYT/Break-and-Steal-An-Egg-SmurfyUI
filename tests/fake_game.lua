@@ -193,6 +193,20 @@ hb.Fire = function(self, ...)
     fire(self, ...)
     local v = root.AssemblyLinearVelocity
     local flung = v ~= nil and v.Magnitude > 1000
+    -- big jumps: must be one frame, flung before and during (looks like a teleport)
+    local pos = root.Position
+    if SG.prevPos and (pos - SG.prevPos).Magnitude > 20 then
+        SG.jumps = (SG.jumps or 0) + 1
+        if not (flung and SG.lastFlung) then
+            SG.unflungJumps = (SG.unflungJumps or 0) + 1
+            table.insert(SG.log, ("unflung jump %.0f studs"):format((pos - SG.prevPos).Magnitude))
+        end
+        if SG.prevJumpFrame == SG.frame - 1 then SG.multiFrameTrips = (SG.multiFrameTrips or 0) + 1 end
+        SG.prevJumpFrame = SG.frame
+    end
+    SG.prevPos = pos
+    SG.frame = (SG.frame or 0) + 1
+    if v then SG.maxSpeed = math.max(SG.maxSpeed or 0, v.Magnitude) end
     SG.lastFlung = flung
     if flung then
         SG.flungFrames += 1
