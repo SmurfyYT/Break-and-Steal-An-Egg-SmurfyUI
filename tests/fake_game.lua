@@ -126,17 +126,27 @@ for _, name in ipairs({ "EggHitRequest", "Notify", "PlaceAnimalRemote" }) do
     SG.remotes[name] = r
 end
 local fn = newInstance("RemoteFunction", "BackpackSellRemote"); fn.Parent = Services.ReplicatedStorage
-local realFire = methods.FireServer
-local hooks, namecallMethod = {}, nil
-methods.FireServer = function(self, ...)
-    if hooks.__namecall then
-        namecallMethod = "FireServer"
-        return hooks.__namecall(self, ...)
+-- like Roblox: every colon call sets the shared "namecall method", and the original
+-- __namecall handler runs whatever method is current when it's called
+local realMethods = {}
+local namecallMethod = nil
+for _, name in ipairs({ "FireServer", "GetFullName", "IsA" }) do
+    local f = methods[name]
+    realMethods[name] = f
+end
+local hooks = {}
+local function originalNamecall(self, ...)
+    return realMethods[namecallMethod](self, ...)
+end
+for name, f in pairs(realMethods) do
+    methods[name] = function(self, ...)
+        namecallMethod = name
+        if hooks.__namecall then return hooks.__namecall(self, ...) end
+        return f(self, ...)
     end
-    return realFire(self, ...)
 end
 function hookmetamethod(_, mm, f)
-    local old = hooks[mm] or function(self, ...) return realFire(self, ...) end
+    local old = hooks[mm] or originalNamecall
     hooks[mm] = f
     return old
 end

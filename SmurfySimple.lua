@@ -1079,7 +1079,7 @@ button(underPage, "Run all depths", Theme.On, function()
 end)
 
 ---------------- Remotes (spy: what your client sends and receives; read-only)
-local Spy = { Out = true, In = true, Rows = {}, Order = {}, Conns = {}, Hooked = false }
+local Spy = { Out = true, In = true, Rows = {}, Conns = {}, Pending = {} }
 
 -- short text for an argument
 local function fmtArg(v, depth)
@@ -1149,11 +1149,14 @@ local function startOutgoing()
     end
     local ok = pcall(function()
         namecallOriginal = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            if Spy.On and App.Alive then
+            -- IMPORTANT: no colon calls (self:Something()) in here before the original runs:
+            -- they'd change the current namecall method and the game's FireServer would
+            -- turn into that call instead. Only copy the call, log it later on another thread.
+            if Spy.On then
                 local method = getnamecallmethod()
                 if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance"
-                    and not (type(checkcaller) == "function" and checkcaller()) then
-                    pcall(spyLog, "→", self, ...)
+                    and not (type(checkcaller) == "function" and checkcaller()) and #Spy.Pending < 500 then
+                    table.insert(Spy.Pending, { self, table.pack(...) })
                 end
             end
             return namecallOriginal(self, ...)
@@ -1227,9 +1230,16 @@ button(remotesPage, "List every remote in the game", nil, function()
     table.sort(names)
     allOut(#names .. " remotes (E = event, F = function)\n" .. table.concat(names, "\n"))
 end)
--- redraw a few times a second at most
+-- log the copied sends (outside the hook), redraw a few times a second at most
 task.spawn(function()
     while App.Alive do
+        if #Spy.Pending > 0 then
+            local pending = Spy.Pending
+            Spy.Pending = {}
+            for _, call in ipairs(pending) do
+                pcall(spyLog, "→", call[1], table.unpack(call[2], 1, call[2].n))
+            end
+        end
         if spyDirty then
             spyDirty = false
             spyRender()
