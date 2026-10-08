@@ -46,6 +46,24 @@ end
 local walkTarget
 hum.__props.MoveTo = function(_, pos) walkTarget = pos end
 local pickaxe = newInstance("Tool", "Pickaxe"); pickaxe.Parent = backpack
+
+-- the game's Auto Swing button (PlayerScripts.Client.Controllers.AutoSwingController), left ON
+local clientFolder = newInstance("Folder", "Client"); clientFolder.Parent = ps
+local controllers = newInstance("Folder", "Controllers"); controllers.Parent = clientFolder
+local autoSwingModule = newInstance("ModuleScript", "AutoSwingController"); autoSwingModule.Parent = controllers
+local autoSwingOn = true
+local autoSwingChanged = { Event = Signal() }
+SG.autoSwing = {
+    IsOn = function() return autoSwingOn end,
+    SetOn = function(v) autoSwingOn = v == true; autoSwingChanged.Event:Fire(autoSwingOn) end,
+    Changed = autoSwingChanged,
+}
+function SG.autoSwingOn() return autoSwingOn end
+local baseRequire = require
+require = function(m)
+    if m == autoSwingModule then return SG.autoSwing end
+    return baseRequire(m)
+end
 root.CFrame = CFrame.new(Vector3.new(0, 3, 0))
 
 -- your plot: a 60 x 20 x 60 hitbox around the origin; another player's plot next to it
@@ -105,6 +123,8 @@ function SG.spawnEgg(zone, name, pos, health)
     nextHatch += 1
     egg:SetAttribute("HatchId", nextHatch)
     tag(egg, "BreakableEgg")
+    SG.eggs = SG.eggs or {}
+    table.insert(SG.eggs, egg)
     return egg
 end
 
@@ -119,6 +139,10 @@ remotes.EggHitRequest.__server = function(egg, id)
     local vertical = math.max(math.abs(rel.Y) - 2.5, 0)
     if math.sqrt(flatDist * flatDist + vertical * vertical) > 8.3 then SG.farHits += 1 return end
     if egg:GetAttribute("Broken") then return end
+    if not egg.__arrived or os.clock() - egg.__arrived < 0.95 then
+        SG.earlyHits = (SG.earlyHits or 0) + 1
+        table.insert(SG.log, ("early hit %.2fs after arriving"):format(egg.__arrived and os.clock() - egg.__arrived or -1))
+    end
     local hp = egg:GetAttribute("Health") - 1
     egg:SetAttribute("Health", hp)
     if hp <= 0 then
@@ -170,8 +194,14 @@ end
 local runFrames = __runFrames
 function __runFrames(n)
     for _ = 1, n do
-        local before = root.Position
         runFrames(1)
+        -- when the character first gets within hit range of each egg
+        for _, egg in ipairs(SG.eggs or {}) do
+            if egg.Parent and not egg.__arrived then
+                local rel = root.Position - egg.Position
+                if Vector3.new(rel.X, 0, rel.Z).Magnitude < 8 and math.abs(rel.Y) < 5 then egg.__arrived = os.clock() end
+            end
+        end
         -- while flinging, the client must look still: no drift between frames except hold moves
         local v = root.AssemblyLinearVelocity
         if SG.lastFlung and v and v.Magnitude > 0 then SG.notStillFrames = (SG.notStillFrames or 0) + 1 end

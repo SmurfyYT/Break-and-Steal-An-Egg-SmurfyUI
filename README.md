@@ -12,6 +12,9 @@
 - **Auto farm (fling)**: break an egg → grab the animal that dropped from it → go home → bank.
   You stay flung the whole time and the fling stops only once you're just *outside* your plot.
   Then you walk in so the game banks the animal.
+  After landing next to an egg it waits 1 second before the first swing.
+  The game's own **Auto Swing** button is kept off (turned off on load and whenever it gets switched on);
+  the farm sends its own hits.
 - **Zone**: Any (nearest egg) or 1-9.
 - **Fling power**: how hard the character looks flung to everyone else.
 - **Bank after every grab** (off = fill the satchel first), **Walk in to bank**.

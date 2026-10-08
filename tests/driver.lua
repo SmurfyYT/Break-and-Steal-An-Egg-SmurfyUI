@@ -27,6 +27,10 @@ local ok, err = xpcall(__main, debug.traceback)
 check(ok, "script loads" .. (ok and "" or (": " .. tostring(err))))
 if not ok then return end
 __runFrames(30)
+check(__SG.autoSwingOn() == false, "the game's Auto Swing is turned off on load")
+__SG.autoSwing.SetOn(true)
+__runFrames(5)
+check(__SG.autoSwingOn() == false, "...and turned back off if something switches it on")
 
 for _, text in ipairs({ "Restore settings", "Unload", "Auto farm (fling)", "Zone: ", "Fling power: ",
     "Fling in place", "Fling TP → nearest egg", "Fling TP → outside my plot" }) do
@@ -64,6 +68,7 @@ click("Auto farm (fling)")
 __runFrames(30)
 for _, line in ipairs(__SG.log) do print("    " .. line) end
 check(__SG.broken == 3, "all 3 zone-1 eggs broken (" .. __SG.broken .. ")")
+check((__SG.earlyHits or 0) == 0, "waits 1 second next to each egg before swinging (" .. (__SG.earlyHits or 0) .. " early hits)")
 check(__SG.fastHits == 0, "never hit faster than the swing cooldown (" .. __SG.fastHits .. ")")
 check(__SG.farHits == 0, "every hit in range (" .. __SG.farHits .. " too far)")
 check(__SG.unheldHits == 0, "pickaxe always held (" .. __SG.unheldHits .. ")")
@@ -76,6 +81,7 @@ check(__SG.flungOnPlot == 0, "never flung while on the plot (" .. __SG.flungOnPl
 check(__SG.bankedWhileFlung == 0, "banking only happens after the fling stops")
 check(__SG.carriedUnflungOutside == 0, "flung the whole way home while carrying (" .. __SG.carriedUnflungOutside .. " frames exposed)")
 check(not __SG.lastFlung, "stopping the farm stops the fling")
+check(__SG.autoSwingOn() == false, "Auto Swing still off after farming")
 
 -- zone 2 egg isn't touched when zone 1 is selected
 __SG.spawnEgg(2, "Swamp Egg", Vector3.new(-600, 2.5, 0), 3)

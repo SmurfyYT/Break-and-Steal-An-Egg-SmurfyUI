@@ -347,6 +347,29 @@ pcall(function()
     local m = controllers and controllers:FindFirstChild("EggLocalHits")
     if m then Mods.LocalHits = require(m) end
 end)
+pcall(function()
+    local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+    local client = ps and ps:FindFirstChild("Client")
+    local controllers = client and client:FindFirstChild("Controllers")
+    local m = controllers and controllers:FindFirstChild("AutoSwingController")
+    if m then Mods.AutoSwing = require(m) end
+end)
+
+-- the game's own Auto Swing button must stay off (the farm does its own hits)
+local function keepAutoSwingOff()
+    local auto = Mods.AutoSwing
+    if not auto or type(auto.SetOn) ~= "function" then return end
+    local ok, on = pcall(function() return auto.IsOn() end)
+    if ok and on == true then pcall(auto.SetOn, false) end
+end
+keepAutoSwingOff()
+if Mods.AutoSwing and Mods.AutoSwing.Changed then
+    pcall(function()
+        track(Mods.AutoSwing.Changed.Event:Connect(function(on)
+            if on and App.Alive then task.defer(keepAutoSwingOff) end
+        end))
+    end)
+end
 
 local function swingCooldown()
     local mult = 1
@@ -455,9 +478,19 @@ end
 local function running(token) return App.Alive and Farm.On and Farm.Token == token end
 
 -- break one egg. true when it broke
+local SWING_DELAY = 1 -- seconds to wait next to an egg before swinging
+
 local function breakEgg(egg, token)
     status("Breaking " .. (egg.Parent and egg.Parent.Name or "egg"))
     if not Fling.TP(besideEgg(egg)) then return false end
+    keepAutoSwingOff()
+    -- arrived: hold still for a second before the first swing
+    equipPickaxe()
+    local arrived = os.clock()
+    while running(token) and isLive(egg) and os.clock() - arrived < SWING_DELAY do
+        Fling.Hold = besideEgg(egg)
+        task.wait(0.1)
+    end
     local lastHp, lastChange = num(egg, "Health", 0), os.clock()
     local cooldown = swingCooldown()
     while running(token) and isLive(egg) and alive() do
@@ -575,6 +608,7 @@ end
 
 function Farm.Start()
     if Farm.On then return end
+    keepAutoSwingOff()
     Farm.On = true
     Farm.Token += 1
     local token = Farm.Token
