@@ -50,6 +50,7 @@ local Defaults = {
     FlingPower = 2,      -- index into FlingPowers
     BankEachGrab = true, -- go home after every animal (off = fill the satchel first)
     WalkInToBank = true, -- after landing outside the plot, walk in to bank
+    WalkOutFirst = true, -- at the egg: stop flinging, walk out of dig reach and back, then mine
     WindowX = 80,
     WindowY = 80,
 }
@@ -420,26 +421,36 @@ local function pivotOf(model)
     return ok and cf.Position or nil
 end
 
--- the animal that came out of this egg: same HatchId, else the nearest one close to where the egg was
+-- the animal that came out of this egg. The game spawns it after the hatch animation as an
+-- AnimalPickup with the egg's HatchId, reserved (ReservedUserId) for whoever broke the egg
 local function pickupFor(hatchId, eggPos)
-    local best, bestDist = nil, 30
+    local reserved, reservedDist = nil, 60
+    local near, nearDist = nil, 30
     for _, m in ipairs(pickups()) do
         if m.Parent and not attr(m, "Despawning") and not reservedForOther(m) then
+            if hatchId ~= nil and attr(m, "HatchId") == hatchId then return m end
             local pos = pivotOf(m)
             if pos then
                 local d = flat(pos - eggPos).Magnitude
-                if hatchId ~= nil and attr(m, "HatchId") == hatchId then return m end
-                if d < bestDist then best, bestDist = m, d end
+                if attr(m, "ReservedUserId") == LocalPlayer.UserId and d < reservedDist then
+                    reserved, reservedDist = m, d
+                elseif hatchId == nil and attr(m, "Hatched") ~= false and d < nearDist then
+                    near, nearDist = m, d
+                end
             end
         end
     end
-    return best
+    return reserved or near
 end
 
--- the StealPrompt: inside the animal, or on the "PromptAnchor" part the game moved it to
+-- the StealPrompt: inside the animal, or on the "PromptAnchor" part the game moved it to.
+-- Takes the prompt nearest the animal even if it's still disabled (then returns nil to wait),
+-- so a neighbour's enabled prompt is never picked by mistake
 local function promptFor(model)
     for _, d in ipairs(model:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and d.Enabled and not reservedForOther(d) then return d end
+        if d:IsA("ProximityPrompt") then
+            return (d.Enabled and not reservedForOther(d)) and d or nil
+        end
     end
     local pos = pivotOf(model)
     if not pos then return nil end
@@ -447,13 +458,14 @@ local function promptFor(model)
     for _, anchor in ipairs(workspace:GetChildren()) do
         if anchor.Name == "PromptAnchor" and anchor:IsA("BasePart") then
             local prompt = anchor:FindFirstChild("StealPrompt")
-            if prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled and not reservedForOther(prompt) then
+            if prompt and prompt:IsA("ProximityPrompt") then
                 local d = (anchor.Position - pos).Magnitude
                 if d < bestDist then best, bestDist = prompt, d end
             end
         end
     end
-    return best
+    if best and best.Enabled and not reservedForOther(best) then return best end
+    return nil
 end
 
 local function firePrompt(prompt)
@@ -477,24 +489,90 @@ end
 
 local function running(token) return App.Alive and Farm.On and Farm.Token == token end
 
--- break one egg. true when it broke
-local SWING_DELAY = 1 -- seconds to wait next to an egg before swinging
+local SWING_DELAY = 1     -- seconds to wait next to an egg (still flung) before anything else
+local HIT_RANGE = 8        -- the game's EggConfig.HitRange (from the egg's surface)
+local HATCH_TIMEOUT = 20   -- the hatch animation plays before the animal spawns
 
+-- distance from a point to the egg's surface, like the game's EggTargeting.SurfaceDistance
+local function surfaceDistance(egg, pos)
+    local size = egg.Size
+    local d = pos - egg.Position
+    local h = math.max(flat(d).Magnitude - math.max(size.X, size.Z) / 2, 0)
+    local v = math.max(math.abs(d.Y) - size.Y / 2, 0)
+    return math.sqrt(h * h + v * v)
+end
+
+local function rootDistance(egg)
+    local root = getRoot()
+    return root and surfaceDistance(egg, root.Position) or math.huge
+end
+
+-- walk (no fling) towards pos until done() or timeout
+local function walkTo(pos, token, timeout, done)
+    local t = os.clock()
+    while running(token) and alive() and os.clock() - t < timeout do
+        if done() then return true end
+        local hum = getHumanoid()
+        if hum then pcall(hum.MoveTo, hum, pos) end
+        task.wait(0.1)
+    end
+    return done()
+end
+
+local function eggBroke(egg)
+    return egg.Parent == nil or attr(egg, "Broken") == true or attr(egg, "Hatching") == true
+        or num(egg, "Health", 1) <= 0
+end
+
+-- stop flinging, walk out of dig reach, walk back next to the egg
+local function walkOutAndBack(egg, token)
+    Fling.Stop()
+    local root = getRoot()
+    if not root then return false end
+    local dir = flat(root.Position - egg.Position)
+    dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(1, 0, 0)
+    local reach = math.max(egg.Size.X, egg.Size.Z) / 2
+    local out = egg.Position + dir * (reach + HIT_RANGE + 6)
+    out = Vector3.new(out.X, root.Position.Y, out.Z)
+    status("Walking out of dig reach")
+    walkTo(out, token, 4, function() return rootDistance(egg) > HIT_RANGE + 2 end)
+    if not running(token) or not isLive(egg) then return false end
+    status("Walking back to the egg")
+    local back = besideEgg(egg)
+    if not walkTo(back.Position, token, 4, function() return rootDistance(egg) <= HIT_RANGE - 3 end) then
+        -- stuck: small step back next to it
+        local r = getRoot()
+        if r then r.CFrame = back end
+    end
+    return running(token) and isLive(egg)
+end
+
+-- break one egg. true when it broke (the game marks it Hatching / Broken)
 local function breakEgg(egg, token)
-    status("Breaking " .. (egg.Parent and egg.Parent.Name or "egg"))
+    status("Going to " .. (egg.Parent and egg.Parent.Name or "egg"))
     if not Fling.TP(besideEgg(egg)) then return false end
     keepAutoSwingOff()
-    -- arrived: hold still for a second before the first swing
     equipPickaxe()
+    -- arrived: hold still (flung) for a second before anything else
     local arrived = os.clock()
     while running(token) and isLive(egg) and os.clock() - arrived < SWING_DELAY do
         Fling.Hold = besideEgg(egg)
         task.wait(0.1)
     end
+    if Settings.WalkOutFirst then
+        if not walkOutAndBack(egg, token) then return eggBroke(egg) end
+    end
+    status("Mining " .. (egg.Parent and egg.Parent.Name or "egg"))
     local lastHp, lastChange = num(egg, "Health", 0), os.clock()
     local cooldown = swingCooldown()
     while running(token) and isLive(egg) and alive() do
-        Fling.Hold = besideEgg(egg)
+        if Fling.On then
+            Fling.Hold = besideEgg(egg)
+        elseif rootDistance(egg) > HIT_RANGE - 2 then
+            -- got pushed away: walk back into reach
+            walkTo(besideEgg(egg).Position, token, 3, function() return rootDistance(egg) <= HIT_RANGE - 3 end)
+        end
+        keepAutoSwingOff()
         if not equipPickaxe() then
             status("No Pickaxe in your backpack")
             task.wait(1)
@@ -504,43 +582,41 @@ local function breakEgg(egg, token)
         task.wait(cooldown)
         local hp = num(egg, "Health", lastHp)
         if hp < lastHp then lastHp, lastChange = hp, os.clock() end
-        if os.clock() - lastChange > 6 then
+        if os.clock() - lastChange > 6 and not eggBroke(egg) then
             status("Egg isn't taking damage, skipping it")
             Skip[egg] = true
             return false
         end
     end
-    return egg.Parent == nil or attr(egg, "Broken") == true
+    return eggBroke(egg)
 end
 
--- grab the animal that dropped. true when CarryCount went up
+-- wait for the hatch animation, then grab the animal. true when CarryCount went up
 local function grabAnimal(hatchId, eggPos, token)
-    status("Waiting for the animal")
-    local animal
+    status("Egg hatching, waiting for the animal")
+    local before = carrying()
     local t = os.clock()
-    while running(token) and os.clock() - t < 8 do
-        animal = pickupFor(hatchId, eggPos)
-        if animal then break end
+    while running(token) and alive() and os.clock() - t < HATCH_TIMEOUT do
+        local animal = pickupFor(hatchId, eggPos)
+        local prompt = animal and promptFor(animal)
+        if animal and prompt then
+            status("Grabbing " .. animal.Name)
+            local pos = pivotOf(animal)
+            if pos then
+                local root = getRoot()
+                local dir = root and flat(root.Position - pos) or Vector3.zero
+                dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(1, 0, 0)
+                local stand = pos + dir * 3
+                Fling.TP(CFrame.lookAt(stand, Vector3.new(pos.X, stand.Y, pos.Z)))
+                firePrompt(prompt)
+                local w = os.clock()
+                while os.clock() - w < 0.8 and carrying() <= before and animal.Parent do task.wait(0.1) end
+                if carrying() > before then return true end
+            end
+        end
         task.wait(0.15)
     end
-    if not animal then return false end
-    status("Grabbing " .. animal.Name)
-    local before = carrying()
-    t = os.clock()
-    while running(token) and animal.Parent and os.clock() - t < 6 do
-        local pos = pivotOf(animal)
-        if not pos then break end
-        local root = getRoot()
-        local dir = root and flat(root.Position - pos) or Vector3.zero
-        dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(1, 0, 0)
-        local stand = pos + dir * 3
-        Fling.TP(CFrame.lookAt(stand, Vector3.new(pos.X, stand.Y, pos.Z)))
-        local prompt = promptFor(animal)
-        if prompt then firePrompt(prompt) end
-        local w = os.clock()
-        while os.clock() - w < 0.8 and carrying() <= before and animal.Parent do task.wait(0.1) end
-        if carrying() > before then break end
-    end
+    if carrying() <= before then status("Animal never showed up") end
     return carrying() > before
 end
 
@@ -951,6 +1027,11 @@ end)
 
 toggle(testPage, "Bank after every grab", function() return Settings.BankEachGrab end, function(v)
     Settings.BankEachGrab = v
+    saveSettings()
+end)
+
+toggle(testPage, "Walk out & back before mining", function() return Settings.WalkOutFirst end, function(v)
+    Settings.WalkOutFirst = v
     saveSettings()
 end)
 

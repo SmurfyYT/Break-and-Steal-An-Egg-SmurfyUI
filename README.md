@@ -9,10 +9,12 @@
 - **Restore settings** stops the farm and the fling, puts every option back to default and resets the window position.
 
 ## Test tab
-- **Auto farm (fling)**: break an egg → grab the animal that dropped from it → go home → bank.
-  You stay flung the whole time and the fling stops only once you're just *outside* your plot.
-  Then you walk in so the game banks the animal.
-  After landing next to an egg it waits 1 second before the first swing.
+- **Auto farm (fling)**, one round:
+  1. Fling TP next to an egg and wait 1 second.
+  2. Stop flinging, walk out of dig reach, walk back (**Walk out & back before mining**, on by default).
+  3. Mine the egg (not flung).
+  4. Wait for the hatch animation (up to 20 s) until the egg's own animal spawns, then fling TP to it and grab it.
+  5. Stay flung back home, stop just *outside* your plot, walk in so the game banks it.
   The game's own **Auto Swing** button is kept off (turned off on load and whenever it gets switched on);
   the farm sends its own hits.
 - **Zone**: Any (nearest egg) or 1-9.

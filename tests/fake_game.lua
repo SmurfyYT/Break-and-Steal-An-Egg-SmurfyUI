@@ -96,15 +96,18 @@ end
 local pickups = newInstance("Folder", "AnimalPickups"); pickups.Parent = workspace
 local nextHatch = 100
 
-local function dropAnimal(pos, hatchId, name)
+local function dropAnimal(pos, hatchId, name, reservedFor, promptDelay)
     local m = newInstance("Model", name)
     m.__pivot = pos + Vector3.new(0, 1, 0)
     m:SetAttribute("HatchId", hatchId)
+    m:SetAttribute("Hatched", true)
+    if reservedFor then m:SetAttribute("ReservedUserId", reservedFor) end
     m.Parent = pickups
     tag(m, "AnimalPickup")
     local anchor = part("PromptAnchor", workspace, m.__pivot + Vector3.new(1, 0, 0), Vector3.new(1, 1, 1))
     local prompt = newInstance("ProximityPrompt", "StealPrompt")
-    prompt.Enabled = true
+    prompt.Enabled = promptDelay == nil
+    if promptDelay then task.delay(promptDelay, function() prompt.Enabled = true end) end
     prompt.HoldDuration = 0.5
     prompt.__pickup = m
     prompt.Parent = anchor
@@ -139,6 +142,10 @@ remotes.EggHitRequest.__server = function(egg, id)
     local vertical = math.max(math.abs(rel.Y) - 2.5, 0)
     if math.sqrt(flatDist * flatDist + vertical * vertical) > 8.3 then SG.farHits += 1 return end
     if egg:GetAttribute("Broken") then return end
+    if SG.lastFlung then SG.flungHits = (SG.flungHits or 0) + 1 end
+    if SG.expectWalkOut and not egg.__wentOut then
+        SG.noWalkOutHits = (SG.noWalkOutHits or 0) + 1
+    end
     if not egg.__arrived or os.clock() - egg.__arrived < 0.95 then
         SG.earlyHits = (SG.earlyHits or 0) + 1
         table.insert(SG.log, ("early hit %.2fs after arriving"):format(egg.__arrived and os.clock() - egg.__arrived or -1))
@@ -146,13 +153,15 @@ remotes.EggHitRequest.__server = function(egg, id)
     local hp = egg:GetAttribute("Health") - 1
     egg:SetAttribute("Health", hp)
     if hp <= 0 then
-        egg:SetAttribute("Broken", true)
+        -- like the game: Hatching (not Broken), the hatch animation, then the animal
+        egg:SetAttribute("Hatching", true)
         SG.broken += 1
-        table.insert(SG.log, "broke " .. egg.Parent.Name)
-        task.delay(0.3, function()
+        table.insert(SG.log, "broke " .. egg.Parent.Name .. ", hatching")
+        local n = SG.broken
+        task.delay(SG.hatchTime or 4, function()
             local pos = egg.Position
             egg.Parent.Parent = nil
-            dropAnimal(pos + Vector3.new(4, 0, 0), egg:GetAttribute("HatchId"), "Animal" .. SG.broken)
+            dropAnimal(pos + Vector3.new(4, 0, 0), egg:GetAttribute("HatchId"), "Animal" .. n, 1, 0.5)
         end)
     end
 end
@@ -200,6 +209,13 @@ function __runFrames(n)
             if egg.Parent and not egg.__arrived then
                 local rel = root.Position - egg.Position
                 if Vector3.new(rel.X, 0, rel.Z).Magnitude < 8 and math.abs(rel.Y) < 5 then egg.__arrived = os.clock() end
+            end
+            -- walked (not flung) out of dig reach after arriving
+            if egg.Parent and egg.__arrived and not egg.__wentOut and not SG.lastFlung then
+                local rel = root.Position - egg.Position
+                local h = math.max(Vector3.new(rel.X, 0, rel.Z).Magnitude - 2, 0)
+                local v = math.max(math.abs(rel.Y) - 2.5, 0)
+                if math.sqrt(h * h + v * v) > 8.3 then egg.__wentOut = os.clock() end
             end
         end
         -- while flinging, the client must look still: no drift between frames except hold moves

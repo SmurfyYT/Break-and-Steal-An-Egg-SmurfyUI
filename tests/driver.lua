@@ -61,6 +61,7 @@ check(not __SG.lastFlung, "...and the fling is off after landing")
 
 -- auto farm, zone 1
 __SG.flungOnPlot = 0
+__SG.expectWalkOut = true
 click("Zone: ") -- Any -> 1
 click("Auto farm (fling)")
 __runFrames(60 * 120)
@@ -69,10 +70,12 @@ __runFrames(30)
 for _, line in ipairs(__SG.log) do print("    " .. line) end
 check(__SG.broken == 3, "all 3 zone-1 eggs broken (" .. __SG.broken .. ")")
 check((__SG.earlyHits or 0) == 0, "waits 1 second next to each egg before swinging (" .. (__SG.earlyHits or 0) .. " early hits)")
+check((__SG.flungHits or 0) == 0, "mines without the fling (" .. (__SG.flungHits or 0) .. " flung hits)")
+check((__SG.noWalkOutHits or 0) == 0, "walks out of dig reach and back before mining (" .. (__SG.noWalkOutHits or 0) .. " hits without)")
 check(__SG.fastHits == 0, "never hit faster than the swing cooldown (" .. __SG.fastHits .. ")")
 check(__SG.farHits == 0, "every hit in range (" .. __SG.farHits .. " too far)")
 check(__SG.unheldHits == 0, "pickaxe always held (" .. __SG.unheldHits .. ")")
-check(__SG.taken == 3, "all 3 animals grabbed (" .. __SG.taken .. ")")
+check(__SG.taken == 3, "waited out the hatch: all 3 animals grabbed (" .. __SG.taken .. ")")
 local tookStray = false
 for _, n in ipairs(__SG.takenNames or {}) do if n == "Stray" then tookStray = true end end
 check(not tookStray, "grabbed the egg's own animal (HatchId), not the stray")
@@ -83,6 +86,7 @@ check(__SG.carriedUnflungOutside == 0, "flung the whole way home while carrying 
 check(not __SG.lastFlung, "stopping the farm stops the fling")
 check(__SG.autoSwingOn() == false, "Auto Swing still off after farming")
 
+__SG.expectWalkOut = false
 -- zone 2 egg isn't touched when zone 1 is selected
 __SG.spawnEgg(2, "Swamp Egg", Vector3.new(-600, 2.5, 0), 3)
 local hits = __SG.hits
