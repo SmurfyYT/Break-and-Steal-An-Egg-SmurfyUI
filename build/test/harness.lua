@@ -92,6 +92,8 @@ CFmt.__mul = function(a, b)
     if type(b) == "table" and b.__t == "CFrame" then return CFrame.new(a.__pos + b.__pos) end
     return a
 end
+CFmt.__add = function(a, b) return CFrame.new(a.Position + b) end
+CFmt.__sub = function(a, b) return CFrame.new(a.Position - b) end
 CFmt.__index = function(c, k)
     if k == "LookVector" then return Vector3.new(0, 0, -1) end
     if k == "RightVector" then return Vector3.new(1, 0, 0) end

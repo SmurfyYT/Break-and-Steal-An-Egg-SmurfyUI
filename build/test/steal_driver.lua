@@ -157,7 +157,75 @@ for _, i in ipairs(__all()) do
 end
 check(billboards >= 3, "ESP billboards for eggs + guards (" .. billboards .. ")")
 
--- 13. debug report
+-- 13. grab tests (Steal tab > Grab tests)
+local function textOf(pattern)
+    for _, i in ipairs(__all()) do
+        if i.ClassName == "TextLabel" and type(i.Text) == "string" and i.Text:find(pattern) and i.Parent then return i.Text end
+    end
+    return nil
+end
+local function goHome()
+    __root.CFrame = CFrame.new(__SG.home + Vector3.new(0, 3.5, 0))
+    __runFrames(5)
+end
+goHome()
+-- test 1: you stay home, the server sees you at the egg, the hook hides it
+local deliveredBefore = __SG.delivered
+local toad = __SG.spawnEgg("Moss Toad", 120, 40)
+__runFrames(60 * 4) -- the remotes fallback refreshes every 3 s
+local farthest, sawReal, sawServer = 0, true, nil
+local conn = game:GetService("RunService").Heartbeat:Connect(function()
+    -- runs after the script's ghost step: a game script reading the root now
+    if __SG.serverPos then sawServer = sawServer or (__SG.serverPos.X > 60) end
+    __SG.gameReading = true
+    local seen = __root.CFrame.Position
+    __SG.gameReading = false
+    if ((seen - __SG.home) * Vector3.new(1, 0, 1)).Magnitude > 5 then sawReal = false end
+end)
+local rconn = game:GetService("RunService").Stepped:Connect(function()
+    -- what you see (the fake fires Stepped after the ghost puts the root back)
+    farthest = math.max(farthest, ((__root.Position - __SG.home) * Vector3.new(1, 0, 1)).Magnitude)
+end)
+check(click("👻 Test 1: Ghost grab (stay here, server sees you at the egg)"), "Ghost grab button")
+__runFrames(60 * 8)
+conn.Disconnect(); rconn.Disconnect()
+check(__SG.hooked, "ghost: __index hook installed")
+check(sawServer, "ghost: the server saw you at the egg")
+check(sawReal, "ghost: game scripts read your real spot (hook)")
+check(farthest < 5, "ghost: you never left home on screen (" .. math.floor(farthest) .. ")")
+check(not __SG.eggOut(toad) and __SG.delivered == deliveredBefore + 1, "ghost: egg grabbed and counted at home")
+check(textOf("Ghost grab: hook on") ~= nil and textOf("grab accepted") ~= nil and textOf("counted") ~= nil, "ghost: result shown")
+
+-- test 2: you go to the egg, the server sees you at home -> the fake server refuses
+local gecko2 = __SG.spawnEgg("Petal Beetle", 130, 30)
+__runFrames(60 * 4) -- the remotes fallback refreshes every 3 s
+local maxServerX = 0
+conn = game:GetService("RunService").Heartbeat:Connect(function()
+    if __SG.serverPos then maxServerX = math.max(maxServerX, __SG.serverPos.X) end
+end)
+check(click("🔁 Test 2: Reverse ghost (go to the egg, server sees you here)"), "Reverse ghost button")
+__runFrames(15)
+local wentToEgg = __root.Position.X > 100
+__runFrames(60 * 4)
+conn.Disconnect()
+check(wentToEgg, "reverse: you were at the egg")
+check(maxServerX < 60, "reverse: the server only saw you at home (" .. math.floor(maxServerX) .. ")")
+check(near(__SG.home), "reverse: back home after")
+check(__SG.eggOut(gecko2) and textOf("Reverse ghost grab: .*grab refused: Not in gameplay") ~= nil, "reverse: refusal reason shown")
+
+-- test 3: walk at the game's speed, grab, fall into the void, respawn home
+goHome()
+local respawnsBefore = __SG.respawns
+check(click("🕳️ Test 3: Walk there, grab, fall into the void"), "Walk + void button")
+__runFrames(60 * 3)
+check(textOf("Walking to") ~= nil, "void: walking")
+__runFrames(60 * 30)
+check(__SG.respawns == respawnsBefore + 1, "void: fell into the void and respawned")
+check(near(__SG.home), "void: back at the plot")
+check(textOf("Walk %+ void: .*grab accepted.*reached the void.*respawned at your plot") ~= nil, "void: result shown")
+check(not getgenv().SmurfysGhost.Active, "ghost off after the tests")
+
+-- 14. debug report
 click("📋 Copy debug report")
 check(labelHas("Report"), "debug report done")
 

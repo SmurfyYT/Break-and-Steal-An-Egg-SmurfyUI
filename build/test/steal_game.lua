@@ -160,7 +160,7 @@ local function carry(request)
     if string.find(r.Uid, "FirstAreaEgg_", 1, true) == 1 and request.FirstAreaSlotKey ~= r.AreaId .. ":" .. r.NestId then
         return false, "Bad slot key"
     end
-    local pos = __root.Position
+    local pos = SG.serverPos or __root.Position -- where the server last saw you
     if pos.X <= 60 then return false, "Not in gameplay" end
     if (pos - r.BoundsCFrame.Position).Magnitude > 10 then
         table.insert(SG.log, "too far from " .. r.AssetCategory)
@@ -247,12 +247,89 @@ require = function(m)
     return harnessRequire(m)
 end
 
+-- the server only gets the root's position as it is right after Heartbeat
+-- (what the ghost tests rely on)
+do
+    local heartbeat = Services.RunService.__signals.Heartbeat
+    local fire = heartbeat.Fire
+    heartbeat.Fire = function(self, ...)
+        fire(self, ...)
+        SG.serverPos = __root.Position
+    end
+end
+
+-- executor hook: hookmetamethod(game, "__index", fn) swaps the instances'
+-- __index; checkcaller() is false while SG.gameReading (a game script reads)
+hookmetamethod = function(_, name, fn)
+    assert(name == "__index", "only __index is faked")
+    local original = Instance_mt.__index
+    Instance_mt.__index = fn
+    SG.hooked = true
+    return original
+end
+checkcaller = function() return not SG.gameReading end
+newcclosure = function(f) return f end
+
+-- Humanoid:MoveTo walks the root (flat) at WalkSpeed
+methods.MoveTo = function(self, pos) self.__moveTo = pos end
+-- per frame: walking, falling under the floor (Y < 0), the void at -500
+workspace.FallenPartsDestroyHeight = -500
+SG.respawns = 0
+function SG.physics()
+    local char = lp.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = __root
+    if hum and hum.__moveTo then
+        local pos = root.Position
+        local flat = (hum.__moveTo - pos) * Vector3.new(1, 0, 1)
+        local step = hum.WalkSpeed / 60
+        if flat.Magnitude <= step then
+            root.CFrame = CFrame.new(Vector3.new(hum.__moveTo.X, pos.Y, hum.__moveTo.Z))
+            hum.__moveTo = nil
+        else
+            root.CFrame = CFrame.new(pos + flat.Unit * step)
+        end
+    end
+    local pos = root.Position
+    if pos.Y < 0 then
+        SG.fallSpeed = (SG.fallSpeed or 0) + 196.2 / 60
+        root.CFrame = CFrame.new(pos - Vector3.new(0, SG.fallSpeed / 60, 0))
+    else
+        SG.fallSpeed = 0
+    end
+    if root.Position.Y < workspace.FallenPartsDestroyHeight then
+        -- the void: the character dies, a carried egg drops, respawn at the plot
+        SG.fallSpeed = 0
+        local r = SG.carrying
+        if r then
+            SG.carrying = nil
+            r.State = "Dropped"
+            table.insert(SG.log, "void dropped " .. r.AssetCategory)
+            carryEvent.OnClientEvent:Fire({ IsCarrying = false, SpeedMultiplier = 1 })
+        end
+        root.Parent = nil
+        local newChar = newInstance("Model", "Tester")
+        local newHum = newInstance("Humanoid", "Humanoid")
+        for k, v in pairs(hum.__props) do if k ~= "Parent" then newHum.__props[k] = v end end
+        newHum.Parent = newChar
+        local newRoot = newInstance("Part", "HumanoidRootPart")
+        newRoot.CFrame = CFrame.new(SG.home + Vector3.new(0, 3.5, 0))
+        newRoot.Parent = newChar
+        __root = newRoot
+        SG.serverPos = nil
+        lp.__props.Character = newChar
+        SG.respawns += 1
+        lp.CharacterAdded:Fire(newChar)
+    end
+end
+
 -- runs after every frame: claim at home, train on the treadmill
 local runFrames = __runFrames
 function __runFrames(n)
     for _ = 1, n do
         runFrames(1)
-        local pos = __root.Position
+        SG.physics()
+        local pos = SG.serverPos or __root.Position
         local r = SG.carrying
         if r and ((pos - SG.home) * Vector3.new(1, 0, 1)).Magnitude < 15 then
             SG.carrying = nil

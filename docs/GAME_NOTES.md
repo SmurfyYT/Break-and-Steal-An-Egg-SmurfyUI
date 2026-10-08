@@ -105,8 +105,24 @@ Parts: `SpawnPoint`, `CenterPoint`, `TreadmillBottom`, `ToUpdate.PetArea`.
 | Group reward | `RF.GroupPerk.RedeemPerk(id)` |
 | Sell all (NPC) | `RE.PetSatchel.SellEveryPet:FireServer(list)` |
 
+## The void
+
+- `workspace.FallenPartsDestroyHeight` = -500 (floor ≈ 68), gravity 196.2.
+- No custom void handling in the client: falling below -500 is Roblox's
+  void kill, then the normal respawn at your plot.
+- A carried egg can be dropped with these reasons (`Shared.Types.AreaEggs`
+  `DropReasons`): PlayerRequest, GuardHit, PlayerSlap, Rewind,
+  CharacterRemoving, HumanoidDied, PlayerRemoving, External, OutOfBounds.
+  Dying (or leaving the bounds) while carrying probably drops the egg.
+  "Rewind" suggests the server rewinds bad movement and drops the egg too.
+
 ## Anti-cheat seen in the client
 
 - `ObbyAntiTPClientController` only covers the monster event's obby region.
 - Nothing client-side checks teleports on the main map; the server decides
   carries and deliveries (unknown checks). Fly home is there as the safer option.
+- The place file has movement-validation modules parented to nil (`Runtime`,
+  `ArcModel`, `Validate`, `Restore`, `Volume`...): violation reasons
+  `HardVerticalTeleport`, `VerticalRise`, `Flight`, evidence `FallFailure`,
+  and corrections ("AdoptCorrectionBaseline"). They look at vertical
+  movement; horizontal teleports aren't named.

@@ -1,5 +1,5 @@
 --[[
-    Smurfy's UI  v1.1  -  Steal An Egg
+    Smurfy's UI  v1.2  -  Steal An Egg
     ------------------------------------------------------------
     - Auto steal: teleports to eggs in the guarded areas, steals them with
       the game's own request and brings them home. Rarest first; filter by
@@ -22,7 +22,7 @@
 -- ========================= CONFIG =========================
 local CONFIG = {
     Title       = "Smurfy's",
-    Version     = "v1.1",
+    Version     = "v1.2",
     DiscordLink = "https://discord.gg/5KFN8bbXhW",
     MenuKey     = Enum.KeyCode.RightShift,
     FlyKey      = Enum.KeyCode.Q,
@@ -2443,6 +2443,345 @@ do
     end))
 end
 
+-- ========================= TEST GRABS (experimental) =========================
+-- Three ways to grab an egg, to see which one the server accepts. Each run
+-- picks the nearest egg your filters allow and reports what the server said.
+--   1. Ghost grab: you stay where you are; every frame the root is moved to
+--      the egg right after physics (that's the position the server gets) and
+--      put back before the frame is drawn. Then ghost off.
+--   2. Reverse ghost: you really teleport to the egg, but every frame the
+--      server is shown the spot you left. Then teleport back.
+--   3. Walk + void: walk to the egg at the game's own speed, grab it, dive
+--      through the floor until the void kills you; the game respawns you at
+--      your plot.
+-- The ghost loop is the reference script's: Heartbeat moves the root to
+-- Ghost.Server, RenderStepped puts it back, and (when the executor has
+-- hookmetamethod) the game's own scripts read the real CFrame meanwhile.
+local Test = { Busy = false, Results = {}, Hooked = false }
+
+-- shared with reloads of the script, so the __index hook is installed once
+local Ghost = (type(getgenv) == "function" and getgenv().SmurfysGhost) or {}
+Ghost.Active, Ghost.Root, Ghost.Server, Ghost.Real, Ghost.Flicked = false, nil, nil, nil, false
+if type(getgenv) == "function" then getgenv().SmurfysGhost = Ghost end
+Test.Ghost = Ghost
+
+function Test.InstallHook()
+    if Ghost.HookInstalled then return true end
+    if type(hookmetamethod) ~= "function" or type(checkcaller) ~= "function" then return false end
+    local wrap = type(newcclosure) == "function" and newcclosure or function(f) return f end
+    local original
+    local ok = pcall(function()
+        original = hookmetamethod(game, "__index", wrap(function(self, key)
+            if Ghost.Flicked and (key == "CFrame" or key == "Position") and self == Ghost.Root and not checkcaller() then
+                return key == "CFrame" and Ghost.Real or Ghost.Real.Position
+            end
+            return original(self, key)
+        end))
+    end)
+    Ghost.HookInstalled = ok and original ~= nil
+    return Ghost.HookInstalled
+end
+
+function Test.GhostOn(root, serverCFrame)
+    Ghost.Root = root
+    Ghost.Server = serverCFrame
+    Ghost.Real = root.CFrame
+    Ghost.Active = true
+end
+
+-- ghost off; returnTo (optional) is where you end up. Mid-flick, the
+-- Heartbeat step puts the root there itself, so the server never gets a
+-- frame of anything else.
+function Test.GhostOff(returnTo)
+    if returnTo then
+        if Ghost.Flicked then
+            Ghost.Real = returnTo
+        else
+            local root = getRoot()
+            if root then
+                root.CFrame = returnTo
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+    end
+    Ghost.Active = false
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not Ghost.Active then return end
+    local root = getRoot()
+    if not root or root ~= Ghost.Root or not Ghost.Server then
+        Ghost.Active = false
+        return
+    end
+    -- after physics: this is the position that replicates
+    Ghost.Real = root.CFrame
+    Ghost.Flicked = true
+    root.CFrame = Ghost.Server
+    RunService.RenderStepped:Wait()
+    -- before the frame is drawn: back to where you really are
+    if root.Parent then
+        root.CFrame = Ghost.Real
+        root.AssemblyLinearVelocity = Vector3.zero
+    end
+    Ghost.Flicked = false
+end))
+track(LocalPlayer.CharacterAdded:Connect(function()
+    Ghost.Active = false
+    Ghost.Flicked = false
+end))
+
+-- the nearest egg your Steal tab filters allow
+function Test.Target()
+    local root = getRoot()
+    if not root then return nil end
+    local speed = World.Speed()
+    local best, bestDistance
+    for _, target in ipairs(World.EggTargets()) do
+        if target.Uid and Farm.Allowed(target, speed) then
+            local d = (target.Position - root.Position).Magnitude
+            if not bestDistance or d < bestDistance then best, bestDistance = target, d end
+        end
+    end
+    return best
+end
+
+function Test.EggState(uid)
+    local rows = World.Field
+    local EggState = World.Mods.EggState
+    if EggState and EggState.ReadFieldEggs then
+        local ok, snap = pcall(EggState.ReadFieldEggs)
+        if ok and type(snap) == "table" and type(snap.Records) == "table" then rows = snap.Records end
+    end
+    for _, r in ipairs(rows or {}) do
+        if r.Uid == uid then return tostring(r.State) end
+    end
+    return "gone"
+end
+
+-- waits up to `seconds` for the carry event / "You stole an EGG!" that came
+-- after `since` (os.clock)
+function Test.WaitFor(field, since, seconds)
+    local t = os.clock()
+    while os.clock() - t < seconds and Alive do
+        if (Farm[field] or 0) > since then return true end
+        task.wait(0.1)
+    end
+    return (Farm[field] or 0) > since
+end
+
+function Test.Report(id, title, lines)
+    local text = table.concat(lines, " · ")
+    Test.Results[id] = title .. ": " .. text
+    table.insert(Farm.Events, 1, "TEST " .. Test.Results[id])
+    if #Farm.Events > 25 then table.remove(Farm.Events) end
+    print("[Smurfy's] TEST " .. Test.Results[id])
+    notify(title, text, 8)
+    Test.Dirty = true
+end
+
+function Test.SetStep(id, text)
+    Test.Results[id] = text
+    Test.Dirty = true
+end
+-- the menu is only touched from Heartbeat (like the auto steal status)
+track(RunService.Heartbeat:Connect(function()
+    if Test.Dirty and Test.Render then
+        Test.Dirty = false
+        pcall(Test.Render)
+    end
+end))
+
+-- runs one test in the background: refuses while another test or auto steal runs
+function Test.Run(id, title, body)
+    if Test.Busy then notify(title, "Another test is still running.", 3) return end
+    if Farm.Enabled then notify(title, "Stop auto steal first.", 3) return end
+    if not getRoot() then notify(title, "No character.", 3) return end
+    local target = Test.Target()
+    if not target then notify(title, "No egg your filters allow is out right now.", 3) return end
+    Test.Busy = true
+    Farm.Pin = nil
+    task.spawn(function()
+        local ok, err = pcall(body, target)
+        Test.GhostOff()
+        Test.Busy = false
+        if not ok then Test.Report(id, title, { "⚠️ error: " .. tostring(err) }) end
+    end)
+end
+
+-- the server's answers after a grab, for the report
+function Test.Outcome(lines, target, grabbed, reason, carrySince, verdictSince, waitHome)
+    table.insert(lines, grabbed and "✅ grab accepted" or ("❌ grab refused" .. (reason and (": " .. tostring(reason)) or "")))
+    if grabbed then
+        table.insert(lines, Test.WaitFor("LastCarry", carrySince, 1) and "carry event ✅" or "no carry event")
+    end
+    if waitHome then
+        local counted = Test.WaitFor("LastVerdict", verdictSince, waitHome)
+        table.insert(lines, counted and "🏡 counted: You stole an EGG! ✅" or "not counted at home")
+    end
+    table.insert(lines, "carrying now: " .. (Farm.Carrying and "yes" or "no"))
+    table.insert(lines, "egg: " .. Test.EggState(target.Uid))
+end
+
+-- 1. ghost grab: the server sees you at the egg, you stay where you are
+function Test.GhostGrab()
+    Test.Run("Ghost", "🧪 Ghost grab", function(target)
+        local root = getRoot()
+        local hooked = Test.InstallHook()
+        local carrySince, verdictSince = Farm.LastCarry or 0, Farm.LastVerdict or 0
+        Test.SetStep("Ghost", "👻 Showing the server you at " .. target.Name .. "...")
+        Test.GhostOn(root, CFrame.new(target.Position + Vector3.new(0, 3, 0)))
+        task.wait(0.5) -- a few replication ticks at the egg
+        local grabbed, reason = World.Carry(target.Uid, target.Record)
+        if grabbed then Test.WaitFor("LastCarry", carrySince, 1) end
+        Test.GhostOff()
+        task.wait(0.1)
+        local lines = { "hook " .. (hooked and "on" or "off (executor has no hookmetamethod)") }
+        Test.Outcome(lines, target, grabbed, reason, carrySince, verdictSince, grabbed and Farm.DeliverWait + 1 or nil)
+        Test.Report("Ghost", "🧪 Ghost grab", lines)
+    end)
+end
+
+-- 2. reverse ghost: you go to the egg, the server sees you at your spot
+function Test.ReverseGrab()
+    Test.Run("Reverse", "🧪 Reverse ghost grab", function(target)
+        local root = getRoot()
+        local hooked = Test.InstallHook()
+        local carrySince, verdictSince = Farm.LastCarry or 0, Farm.LastVerdict or 0
+        local saved = root.CFrame
+        Test.SetStep("Reverse", "👻 At " .. target.Name .. ", the server sees your spot...")
+        -- same frame: the server never gets the egg position
+        Test.GhostOn(root, saved)
+        root.CFrame = CFrame.new(target.Position + Vector3.new(0, 3, 0))
+        task.wait(0.5)
+        local grabbed, reason = World.Carry(target.Uid, target.Record)
+        if grabbed then Test.WaitFor("LastCarry", carrySince, 1) end
+        Test.GhostOff(saved) -- back to your spot in the same step
+        task.wait(0.1)
+        local lines = { "hook " .. (hooked and "on" or "off (executor has no hookmetamethod)") }
+        Test.Outcome(lines, target, grabbed, reason, carrySince, verdictSince, grabbed and Farm.DeliverWait + 1 or nil)
+        Test.Report("Reverse", "🧪 Reverse ghost grab", lines)
+    end)
+end
+
+-- 3. walk to the egg at the game's speed, grab, fall into the void, respawn home
+function Test.WalkVoid()
+    Test.Run("Void", "🧪 Walk + void", function(target)
+        local title = "🧪 Walk + void"
+        if Player.Flying then Test.Report("Void", title, { "turn fly off first" }) return end
+        local hum, root = getHumanoid(), getRoot()
+        if not hum then Test.Report("Void", title, { "no humanoid" }) return end
+        local char = LocalPlayer.Character
+        local goal = target.Position
+        local flat = function(a, b) return ((a - b) * Vector3.new(1, 0, 1)).Magnitude end
+        -- the game's own walk speed (pause the Player tab's override)
+        Player.PauseWalk = true
+        if Player.WalkEnabled then hum.WalkSpeed = Defaults.WalkSpeed end
+        local finish = function()
+            Player.PauseWalk = false
+        end
+
+        -- walk
+        local speed = math.max(hum.WalkSpeed, 1)
+        local deadline = os.clock() + flat(root.Position, goal) / speed * 1.5 + 20
+        local nextMove, lastPos, lastCheck = 0, root.Position, os.clock()
+        while Alive and LocalPlayer.Character == char and root.Parent do
+            local left = flat(root.Position, goal)
+            if left < 5 then break end
+            if os.clock() > deadline then
+                hum:MoveTo(root.Position)
+                finish()
+                Test.Report("Void", title, { "couldn't reach the egg (" .. math.floor(left) .. " studs left)" })
+                return
+            end
+            if not Farm.StillOut(target) then
+                hum:MoveTo(root.Position)
+                finish()
+                Test.Report("Void", title, { "egg was taken while walking" })
+                return
+            end
+            if os.clock() >= nextMove then
+                nextMove = os.clock() + 2 -- MoveTo gives up after 8 s, so keep asking
+                hum:MoveTo(goal)
+            end
+            if os.clock() - lastCheck >= 1 then
+                if (root.Position - lastPos).Magnitude < 1 then hum.Jump = true end -- stuck: jump
+                lastPos, lastCheck = root.Position, os.clock()
+            end
+            Test.SetStep("Void", string.format("🚶 Walking to %s (%d studs, speed %d)", target.Name, math.floor(left), math.floor(hum.WalkSpeed)))
+            task.wait(0.2)
+        end
+        if LocalPlayer.Character ~= char or not root.Parent then
+            finish()
+            Test.Report("Void", title, { "died while walking" })
+            return
+        end
+
+        -- grab
+        local carrySince, verdictSince = Farm.LastCarry or 0, Farm.LastVerdict or 0
+        Test.SetStep("Void", "🫳 Grabbing " .. target.Name)
+        local grabbed, reason
+        for _ = 1, 3 do
+            grabbed, reason = World.Carry(target.Uid, target.Record)
+            if grabbed or not Farm.StillOut(target) then break end
+            hum:MoveTo(goal)
+            task.wait(0.6)
+        end
+        if not grabbed then
+            finish()
+            Test.Report("Void", title, { "❌ grab refused" .. (reason and (": " .. tostring(reason)) or ""), "egg: " .. Test.EggState(target.Uid) })
+            return
+        end
+        Test.WaitFor("LastCarry", carrySince, 1)
+
+        -- dive: noclip, push the root under the floor, then let it fall
+        Test.SetStep("Void", "🕳️ Diving into the void")
+        local hadNoclip = Player.Noclip
+        setNoclip(true)
+        local startY = root.Position.Y
+        local pushUntil = os.clock() + 3
+        while root.Parent and root.Position.Y > startY - 15 and os.clock() < pushUntil do
+            root.CFrame = root.CFrame - Vector3.new(0, 2, 0)
+            root.AssemblyLinearVelocity = Vector3.new(0, -80, 0)
+            RunService.Heartbeat:Wait()
+        end
+        local lowest = root.Position.Y
+        local fallUntil = os.clock() + 20
+        while Alive and LocalPlayer.Character == char and root.Parent and os.clock() < fallUntil do
+            lowest = math.min(lowest, root.Position.Y)
+            Test.SetStep("Void", string.format("🕳️ Falling: Y %d (void at %d)", math.floor(root.Position.Y), math.floor(workspace.FallenPartsDestroyHeight or -500)))
+            task.wait(0.1)
+        end
+        local reachedVoid = LocalPlayer.Character ~= char or not root.Parent
+        if not reachedVoid then
+            setNoclip(hadNoclip)
+            finish()
+            local lines = { "✅ grab accepted", string.format("never reached the void (lowest Y %d, now Y %d)", math.floor(lowest), math.floor(root.Position.Y)) }
+            table.insert(lines, "carrying now: " .. (Farm.Carrying and "yes" or "no"))
+            Test.Report("Void", title, lines)
+            return
+        end
+
+        -- respawn at the plot
+        Test.SetStep("Void", "💀 Fell into the void, waiting to respawn")
+        local respawnUntil = os.clock() + 15
+        while Alive and os.clock() < respawnUntil do
+            local c = LocalPlayer.Character
+            if c and c ~= char and c:FindFirstChild("HumanoidRootPart") then break end
+            task.wait(0.2)
+        end
+        setNoclip(hadNoclip)
+        finish()
+        local lines = { "✅ grab accepted", "reached the void" }
+        local counted = Test.WaitFor("LastVerdict", verdictSince, Farm.DeliverWait + 1)
+        table.insert(lines, World.IsHome() and "respawned at your plot" or "respawned away from your plot")
+        table.insert(lines, counted and "🏡 counted: You stole an EGG! ✅" or "not counted")
+        table.insert(lines, "carrying now: " .. (Farm.Carrying and "yes" or "no"))
+        table.insert(lines, "egg: " .. Test.EggState(target.Uid))
+        Test.Report("Void", title, lines)
+    end)
+end
+
 -- ========================= BASE AUTOMATION =========================
 -- place stolen eggs, hatch grown ones, collect away earnings, equip your
 -- best pets, train on the treadmill. Runs in its own thread (game calls).
@@ -3995,6 +4334,22 @@ end))
 StealTab:Section("🛡️ Guards")
 StealTab:Toggle("🚨 Warn me when a guard chases me", true, function(on) Guard.Alert = on end)
 StealTab:Toggle("🏃 Teleport home when a guard chases me", false, function(on) Guard.AutoEscape = on end)
+
+-- 🧪 tests: three experimental ways to grab an egg
+StealTab:Section("🧪 Grab tests (experimental)")
+StealTab:Label("Each button takes the nearest egg your filters allow and shows what the server said. "
+    .. "Stand where you want to come back to (your plot, to see if the egg counts). Auto steal must be off.")
+StealTab:Button("👻 Test 1: Ghost grab (stay here, server sees you at the egg)", Test.GhostGrab)
+StealTab:Button("🔁 Test 2: Reverse ghost (go to the egg, server sees you here)", Test.ReverseGrab)
+StealTab:Button("🕳️ Test 3: Walk there, grab, fall into the void", Test.WalkVoid)
+local testLabel = StealTab:Label("No test run yet.")
+function Test.Render()
+    local lines = {}
+    for _, id in ipairs({ "Ghost", "Reverse", "Void" }) do
+        if Test.Results[id] then table.insert(lines, Test.Results[id]) end
+    end
+    testLabel.Text = #lines > 0 and table.concat(lines, "\n\n") or "No test run yet."
+end
 
 -- 🔎 eggs out right now, by area: tap one to teleport to it
 StealTab:Section("🔎 Eggs out now")

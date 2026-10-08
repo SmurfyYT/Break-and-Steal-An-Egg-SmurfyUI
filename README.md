@@ -4,14 +4,14 @@ Private source for the Steal An Egg script, built on the Smurfy's UI framework
 (same window, tabs, phone layout, S button, themes, saved spots as the Ride A
 Pet script).
 
-## Features (v1.1)
+## Features (v1.2)
 
 | Tab | What's in it |
 |---|---|
 | 🏠 Home | Session time, eggs stolen, your Speed (+ gained), Money/s, Discord |
 | 👤 Player | WalkSpeed, JumpPower, infinite jump, fly, noclip |
 | 📍 Teleport | My plot, my treadmill, all 13 areas (with the Speed each needs), shops and machines, saved spots, Back |
-| 🥚 Steal | **Auto steal** with the game's own steal request: rarest first, then the hardest area you're allowed in. Filters: lowest rarity, only areas your Speed can handle, per-area toggles. Teleport or fly home, waits for "You stole an EGG!". Trains on your treadmill while no eggs are out. Guard alert / auto escape. Live egg list (pet · rarity · area). **Base**: auto place eggs, auto hatch, auto collect away earnings, auto equip best, stand on treadmill. |
+| 🥚 Steal | **Auto steal** with the game's own steal request: rarest first, then the hardest area you're allowed in. Filters: lowest rarity, only areas your Speed can handle, per-area toggles. Teleport or fly home, waits for "You stole an EGG!". Trains on your treadmill while no eggs are out. Guard alert / auto escape. Live egg list (pet · rarity · area). **Base**: auto place eggs, auto hatch, auto collect away earnings, auto equip best, stand on treadmill. **🧪 Grab tests** (experimental, one egg each, shows what the server answered): ghost grab, reverse ghost grab, walk + void. |
 | 👁️ ESP | Eggs (pet, rarity color, area), guards (red when awake, who they chase), players |
 | 🌍 World | Fullbright, no shadows, remove trees / weather |
 | ⚙️ Settings | Keybinds, device layout, themes, battery saver, anti-AFK, server hop, 🧪 Debug report |
@@ -32,7 +32,9 @@ Runs the UI as a phone and a PC, then plays auto steal in a fake Steal An Egg
 (`build/test/steal_game.lua` + `steal_driver.lua`, built from the real game's
 rules): rarest first, tutorial slot key, speed / rarity / area filters, fly
 home, treadmill training, place + hatch + collect + equip best, guard escape,
-teleports, ESP, debug report, unload. The PC pass runs without the game's
+teleports, ESP, the three grab tests (the fake server only sees the root's
+position after Heartbeat, and has a void at Y -500 that respawns you at your
+plot), debug report, unload. The PC pass runs without the game's
 modules to check the remotes-only fallback.
 Needs the `luau` CLI (github.com/luau-lang/luau/releases).
 
