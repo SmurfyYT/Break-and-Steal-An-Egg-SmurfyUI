@@ -499,23 +499,24 @@ local function travel(method, target, token, opts)
     elseif method == "Glide" then
         glidePath({ root.Position, target.Position }, opts.speed or 300, token)
     elseif method == "Velocity" then
-        -- raw AssemblyLinearVelocity: fling without hiding, let physics carry the character
-        local dir = (target.Position - root.Position)
-        local dist = dir.Magnitude
+        -- raw AssemblyLinearVelocity: re-aim every frame so gravity never accumulates
+        local dist = (target.Position - root.Position).Magnitude
         if dist < 0.1 then return labRunning(token) end
         local speed = opts.speed or math.clamp(dist / 0.4, 50, 2000)
         markOwn(dist / speed + 0.5)
-        zeroMotion(root)
-        root.AssemblyLinearVelocity = dir.Unit * speed
-        -- wait until close enough or time runs out
+        noclip(true)
         local t0 = os.clock()
         local limit = dist / speed + 0.5
         while labRunning(token) and os.clock() - t0 < limit do
             local r2 = getRoot()
             if not r2 then break end
-            if (r2.Position - target.Position).Magnitude < 4 then break end
+            local remaining = target.Position - r2.Position
+            if remaining.Magnitude < 4 then break end
+            r2.AssemblyAngularVelocity = Vector3.zero
+            r2.AssemblyLinearVelocity = remaining.Unit * speed
             RunService.Stepped:Wait()
         end
+        noclip(false)
         local r2 = getRoot()
         if r2 then zeroMotion(r2) end
     elseif method == "VForce" then
