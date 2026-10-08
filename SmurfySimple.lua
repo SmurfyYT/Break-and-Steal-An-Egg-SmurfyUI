@@ -1,27 +1,23 @@
 --[[
-    Smurfy's Simple UI — Break & Steal an Egg
+    Smurfy's Simple UI — Movement Lab (Break & Steal an Egg)
     Made for Delta (Android / BlueStacks). Paste the whole file into the executor.
 
-    Main tab : restore settings, unload.
-    Test tab : hidden TP (Ghost or Fling) + auto farm.
+    Main    : restore settings, unload.
+    Snap    : live snap-back watcher (did the server drag you back?) + a quick check.
+    Ladder  : plain teleports at growing distances: where does the server pull you back?
+    Methods : Plain / Ghost / Fling / Glide side by side at 50, 250, 1000 studs.
+    Warmup  : how long you must be hidden before the jump (0, 1 frame, 0.05, 0.15, 0.5 s).
+    Glide   : fastest glide speed the server accepts.
+    Endure  : how long you can stay hidden (5, 15, 30, 60 s) before something happens.
+    Under   : travel under the map and come up at the target.
 
-    Both methods hide where you are from the server / other players, while on your own
-    screen you stand still on a "hold" CFrame:
-      Ghost: right after physics (Heartbeat) your CFrame is moved 9e9 studs away, so that's
-             what replicates. The game's own scripts still read your real spot (hookmetamethod).
-      Fling: right after physics your velocity is set huge, so you look flung out of the map.
-    Before the next physics step and before drawing (Stepped / RenderStepped) you're put back
-    on the hold point. A TP = hidden in place for a moment, then the hold point jumps in one frame.
-    Hitting eggs, grabbing animals and banking need the server to see you there, so the ghost
-    is off for those.
-
-    Auto farm (game rules from the place's client scripts):
-      1. pick a live egg (parts tagged "BreakableEgg", in Build.ZoneBuilds.ZoneN.Eggs)
-      2. hidden TP next to it, wait 1 s, unhide, walk out of dig reach and back
-      3. mine it: EggHitRequest(egg, hitId) once per swing, Pickaxe held (game's Auto Swing kept off)
-      4. it turns "Hatching"; after the hatch animation the game spawns its animal (same HatchId)
-      5. hidden TP to it, trigger its StealPrompt (CarryCount goes up)
-      6. hidden all the way back, unhide just OUTSIDE your plot's Hitbox, walk in to bank
+    Hiding methods (what replicates right after physics, then you're put back on a "hold"
+    point before the next physics step and before drawing, so you stand still on screen):
+      Ghost: CFrame moved 9e9 studs away (the game's own scripts read your real spot via
+             hookmetamethod when the executor has it).
+      Fling: velocity set huge.
+    A test result "ok" = you stayed where you went for 2 s after arriving (not hidden).
+    "BACK" = something moved you more than 8 studs away from there (server pull-back).
 ]]
 
 local ENV = (getgenv and getgenv()) or _G
@@ -32,8 +28,6 @@ end
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
@@ -46,14 +40,18 @@ local function track(conn)
 end
 
 ---------------------------------------------------------------- settings
-local CONFIG_FILE = "SmurfySimple_BreakStealEgg.json"
+local CONFIG_FILE = "SmurfySimple_MovementLab.json"
 local Defaults = {
-    Zone = 0,            -- 0 = any zone, else 1-9
-    Method = "Ghost",    -- "Ghost" (far CFrame) or "Fling" (huge velocity)
     FlingLevel = 4,      -- index into FlingPowers (Max)
-    BankEachGrab = true, -- go home after every animal (off = fill the satchel first)
-    WalkInToBank = true, -- after landing outside the plot, walk in to bank
-    WalkOutFirst = true, -- at the egg: stop flinging, walk out of dig reach and back, then mine
+    Warmup = 0.15,       -- seconds hidden before a jump (Warmup tab can change it)
+    Watch = true,        -- live snap-back watcher
+    WarmupMethod = "Ghost",
+    WarmupDist = 250,
+    GlideDist = 250,
+    EndureMethod = "Ghost",
+    UnderDepth = 50,
+    UnderDist = 250,
+    UnderSpeed = 300,
     WindowX = 80,
     WindowY = 80,
 }
@@ -88,18 +86,10 @@ local function getHumanoid()
     local c = getChar()
     return c and c:FindFirstChildOfClass("Humanoid") or nil
 end
-local function alive()
-    local h = getHumanoid()
-    return h ~= nil and h.Health > 0 and getRoot() ~= nil
-end
 
 local function attr(inst, name)
     local ok, v = pcall(inst.GetAttribute, inst, name)
     return ok and v or nil
-end
-local function num(inst, name, default)
-    local v = attr(inst, name)
-    return type(v) == "number" and v or default
 end
 
 local function flat(v) return Vector3.new(v.X, 0, v.Z) end
@@ -134,7 +124,10 @@ local function zeroMotion(root)
     root.AssemblyAngularVelocity = Vector3.zero
 end
 
-local WARMUP = 0.15 -- seconds hidden in place before the jump, so the jump itself is never seen
+-- jumps made by this script (so the snap-back watcher doesn't count them)
+local ownMoveUntil = 0
+local function markOwn(seconds) ownMoveUntil = math.max(ownMoveUntil, os.clock() + (seconds or 0.1)) end
+
 local SETTLE = 0.1  -- seconds hidden on arrival before doing anything there
 local GHOST_FAR = CFrame.new(9e9, 0, 9e9)
 
@@ -187,7 +180,8 @@ local function newMover(name, afterPhysics)
 
     -- the "teleport": hidden for a moment, then the whole trip in ONE frame.
     -- Only the hold point moves; the pin applies it before physics
-    function M.TP(target)
+    -- warmup: seconds hidden in place before the jump (-1 = one frame, 0 = none)
+    function M.TP(target, warmup)
         local root = getRoot()
         if not root then return false end
         if not M.On then
@@ -197,11 +191,17 @@ local function newMover(name, afterPhysics)
             if not root then return false end
             M.Start(root.CFrame)
         end
+        warmup = warmup or Settings.Warmup
         local t = os.clock()
-        while M.On and App.Alive and os.clock() - (M.Since or t) < WARMUP do
+        if warmup < 0 then
             RunService.Stepped:Wait()
+        else
+            while M.On and App.Alive and os.clock() - (M.Since or t) < warmup do
+                RunService.Stepped:Wait()
+            end
         end
         if not App.Alive or not M.On then return false end
+        markOwn()
         M.Hold = target
         RunService.Stepped:Wait()
         t = os.clock()
@@ -252,8 +252,6 @@ function Ghost.Start(hold)
     ghostStart(hold)
 end
 
--- the method picked in the UI
-local function Mover() return Settings.Method == "Fling" and Fling or Ghost end
 local function hidden() return Fling.On or Ghost.On end
 local function stopMovers()
     Fling.Stop()
@@ -265,12 +263,6 @@ local function unhide()
     Fling.Stop()
     if wasGhost then task.wait(0.2) end
 end
-local function moverTP(target)
-    local m = Mover()
-    if (m == Fling and Ghost.On) or (m == Ghost and Fling.On) then stopMovers() end
-    return m.TP(target)
-end
-
 ---------------------------------------------------------------- game: places
 local function myPlot()
     local plots = workspace:FindFirstChild("Plots")
@@ -297,7 +289,7 @@ end
 local function outsidePlotCFrame()
     local hb = plotHitbox()
     if not hb then return nil end
-    local towards = zoneHitbox(math.max(Settings.Zone, 1)) or zoneHitbox(1)
+    local towards = zoneHitbox(1)
     local dir = towards and flat(towards.Position - hb.Position) or Vector3.zero
     if dir.Magnitude < 1 then
         local root = getRoot()
@@ -343,468 +335,214 @@ leavePlot = function()
         root.CFrame = spot
         RunService.Stepped:Wait()
     end
+    -- stop walking, or the humanoid keeps heading for the spot after a teleport
+    root = getRoot()
+    if hum and root then pcall(hum.MoveTo, hum, root.Position) end
 end
 
-local function plotWalkTarget(hb)
-    local ground = groundBelow(hb.Position)
-    return Vector3.new(hb.Position.X, ground and ground.Y or (hb.Position.Y - hb.Size.Y / 2), hb.Position.Z)
-end
 
----------------------------------------------------------------- game: eggs
-local function isLive(egg)
-    return egg and egg.Parent ~= nil and not attr(egg, "Broken") and not attr(egg, "Hatching") and not attr(egg, "Despawning")
-end
+---------------------------------------------------------------- lab: shared test helpers
+local Lab = { Busy = false, Token = 0 }
+local function labRunning(token) return App.Alive and Lab.Token == token end
 
-local function eggZone(egg)
-    local node = egg
-    while node and node ~= workspace do
-        local n = node.Name:match("^Zone(%d+)$")
-        if n then return tonumber(n) end
-        node = node.Parent
-    end
-    return nil
-end
-
-local function allEggs()
-    local list, seen = {}, {}
-    local ok, tagged = pcall(CollectionService.GetTagged, CollectionService, "BreakableEgg")
-    for _, egg in ipairs(ok and tagged or {}) do
-        if egg:IsA("BasePart") and not seen[egg] then seen[egg] = true; table.insert(list, egg) end
-    end
-    local build = workspace:FindFirstChild("Build")
-    local zones = build and build:FindFirstChild("ZoneBuilds")
-    for _, zone in ipairs(zones and zones:GetChildren() or {}) do
-        local eggs = zone:FindFirstChild("Eggs")
-        for _, d in ipairs(eggs and eggs:GetDescendants() or {}) do
-            if d.Name == "Egg" and d:IsA("BasePart") and not seen[d] then seen[d] = true; table.insert(list, d) end
-        end
-    end
-    return list
-end
-
-local Skip = setmetatable({}, { __mode = "k" }) -- eggs we gave up on
-
-local function pickEgg()
-    local root = getRoot()
-    if not root then return nil end
-    local best, bestDist = nil, math.huge
-    for _, egg in ipairs(allEggs()) do
-        if isLive(egg) and not Skip[egg] and (Settings.Zone == 0 or eggZone(egg) == Settings.Zone) then
-            local d = (egg.Position - root.Position).Magnitude
-            if d < bestDist then best, bestDist = egg, d end
-        end
-    end
-    return best
-end
-
--- where to stand to hit an egg: next to it, feet on its bottom (hit range is 8 from the surface)
-local function besideEgg(egg)
-    local root = getRoot()
-    local dir = root and flat(root.Position - egg.Position) or Vector3.zero
-    if dir.Magnitude < 0.5 then dir = Vector3.new(1, 0, 0) end
-    dir = dir.Unit
-    local reach = math.max(egg.Size.X, egg.Size.Z) / 2 + 3
-    local pos = egg.Position + dir * reach
-    pos = Vector3.new(pos.X, egg.Position.Y - egg.Size.Y / 2 + 3, pos.Z)
-    return CFrame.lookAt(pos, Vector3.new(egg.Position.X, pos.Y, egg.Position.Z))
-end
-
----------------------------------------------------------------- game: pickaxe + hits
-local function pickaxe()
-    local char, backpack = getChar(), LocalPlayer:FindFirstChild("Backpack")
-    local tool = char and char:FindFirstChild("Pickaxe")
-    if tool and tool:IsA("Tool") then return tool, true end
-    tool = backpack and backpack:FindFirstChild("Pickaxe")
-    if tool and tool:IsA("Tool") then return tool, false end
-    return nil, false
-end
-
-local function equipPickaxe()
-    local tool, held = pickaxe()
-    if held then return true end
-    local hum = getHumanoid()
-    if tool and hum then pcall(hum.EquipTool, hum, tool) end
-    return select(2, pickaxe())
-end
-
-local Mods = {}
-pcall(function()
-    local shared = ReplicatedStorage:FindFirstChild("Shared")
-    local m = shared and shared:FindFirstChild("RobuxShopConfig")
-    if m then Mods.Shop = require(m) end
-end)
-pcall(function()
-    local ps = LocalPlayer:FindFirstChild("PlayerScripts")
-    local client = ps and ps:FindFirstChild("Client")
-    local controllers = client and client:FindFirstChild("Controllers")
-    local m = controllers and controllers:FindFirstChild("EggLocalHits")
-    if m then Mods.LocalHits = require(m) end
-end)
-pcall(function()
-    local ps = LocalPlayer:FindFirstChild("PlayerScripts")
-    local client = ps and ps:FindFirstChild("Client")
-    local controllers = client and client:FindFirstChild("Controllers")
-    local m = controllers and controllers:FindFirstChild("AutoSwingController")
-    if m then Mods.AutoSwing = require(m) end
-end)
-
--- the game's own Auto Swing button must stay off (the farm does its own hits)
-local function keepAutoSwingOff()
-    local auto = Mods.AutoSwing
-    if not auto or type(auto.SetOn) ~= "function" then return end
-    local ok, on = pcall(function() return auto.IsOn() end)
-    if ok and on == true then pcall(auto.SetOn, false) end
-end
-keepAutoSwingOff()
-if Mods.AutoSwing and Mods.AutoSwing.Changed then
-    pcall(function()
-        track(Mods.AutoSwing.Changed.Event:Connect(function(on)
-            if on and App.Alive then task.defer(keepAutoSwingOff) end
-        end))
-    end)
-end
-
-local function swingCooldown()
-    local mult = 1
-    if Mods.Shop and Mods.Shop.SwingMultiplierFor then
-        local ok, v = pcall(Mods.Shop.SwingMultiplierFor, LocalPlayer)
-        if ok and type(v) == "number" and v > 0 then mult = v end
-    end
-    return 0.5 / mult + 0.04
-end
-
-local hitCounter = 0
-local function hitEgg(egg)
-    local remote = ReplicatedStorage:FindFirstChild("EggHitRequest")
-    if not remote then return false end
-    local id
-    if Mods.LocalHits and Mods.LocalHits.Announce then
-        local ok, v = pcall(Mods.LocalHits.Announce, egg, 1)
-        if ok and type(v) == "number" then id = v end
-    end
-    if not id then hitCounter += 1; id = hitCounter end
-    return pcall(remote.FireServer, remote, egg, id)
-end
-
----------------------------------------------------------------- game: animals + prompts
-local function carrying() return num(LocalPlayer, "CarryCount", 0) end
-local function capacity() return math.max(num(LocalPlayer, "SatchelCapacity", 1), 1) end
-
-local function reservedForOther(inst)
-    local id = attr(inst, "ReservedUserId")
-    return type(id) == "number" and id ~= LocalPlayer.UserId
-end
-
-local function pickups()
-    local list, seen = {}, {}
-    local ok, tagged = pcall(CollectionService.GetTagged, CollectionService, "AnimalPickup")
-    for _, m in ipairs(ok and tagged or {}) do
-        if m:IsA("Model") and not seen[m] then seen[m] = true; table.insert(list, m) end
-    end
-    local folder = workspace:FindFirstChild("AnimalPickups")
-    for _, m in ipairs(folder and folder:GetChildren() or {}) do
-        if m:IsA("Model") and not seen[m] then seen[m] = true; table.insert(list, m) end
-    end
-    return list
-end
-
-local function pivotOf(model)
-    local ok, cf = pcall(model.GetPivot, model)
-    return ok and cf.Position or nil
-end
-
--- the animal that came out of this egg. The game spawns it after the hatch animation as an
--- AnimalPickup with the egg's HatchId, reserved (ReservedUserId) for whoever broke the egg
-local function pickupFor(hatchId, eggPos)
-    local reserved, reservedDist = nil, 60
-    local near, nearDist = nil, 30
-    for _, m in ipairs(pickups()) do
-        if m.Parent and not attr(m, "Despawning") and not reservedForOther(m) then
-            if hatchId ~= nil and attr(m, "HatchId") == hatchId then return m end
-            local pos = pivotOf(m)
-            if pos then
-                local d = flat(pos - eggPos).Magnitude
-                if attr(m, "ReservedUserId") == LocalPlayer.UserId and d < reservedDist then
-                    reserved, reservedDist = m, d
-                elseif hatchId == nil and attr(m, "Hatched") ~= false and d < nearDist then
-                    near, nearDist = m, d
+-- noclip while travelling under the map
+local noclipConn, noclipSaved = nil, {}
+local function noclip(on)
+    if on and not noclipConn then
+        noclipConn = RunService.Stepped:Connect(function()
+            local char = getChar()
+            for _, p in ipairs(char and char:GetDescendants() or {}) do
+                if p:IsA("BasePart") and p.CanCollide then
+                    noclipSaved[p] = true
+                    p.CanCollide = false
                 end
             end
-        end
+        end)
+    elseif not on and noclipConn then
+        noclipConn:Disconnect()
+        noclipConn = nil
+        for p in pairs(noclipSaved) do pcall(function() p.CanCollide = true end) end
+        table.clear(noclipSaved)
     end
-    return reserved or near
 end
 
--- the StealPrompt: inside the animal, or on the "PromptAnchor" part the game moved it to.
--- Takes the prompt nearest the animal even if it's still disabled (then returns nil to wait),
--- so a neighbour's enabled prompt is never picked by mistake
-local function promptFor(model)
-    for _, d in ipairs(model:GetDescendants()) do
-        if d:IsA("ProximityPrompt") then
-            return (d.Enabled and not reservedForOther(d)) and d or nil
+local function stopLab()
+    Lab.Token += 1
+    Lab.Busy = false
+    stopMovers()
+    noclip(false)
+end
+
+-- run fn(token) as the only test; out(text) shows errors
+local function runLab(fn, out)
+    if Lab.Busy then out("Another test is running. Press Stop first.") return end
+    Lab.Busy = true
+    Lab.Token += 1
+    local token = Lab.Token
+    task.spawn(function()
+        local ok, err = pcall(fn, token)
+        if not ok then out("Error: " .. tostring(err)) end
+        stopMovers()
+        noclip(false)
+        if Lab.Token == token then Lab.Busy = false end
+    end)
+end
+
+-- ground under (x, z), searching from above the reference height
+local function groundAt(pos, refY)
+    local ok, hit = pcall(function()
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { getChar() }
+        pcall(function() params.RespectCanCollide = true end)
+        return workspace:Raycast(Vector3.new(pos.X, refY + 150, pos.Z), Vector3.new(0, -600, 0), params)
+    end)
+    return ok and hit and hit.Position or nil
+end
+
+-- a standing spot `dist` studs away with ground under it: camera direction first, then turning
+local function findTarget(origin, dist)
+    local cam = workspace.CurrentCamera
+    local look = cam and flat(cam.CFrame.LookVector) or Vector3.new(0, 0, -1)
+    if look.Magnitude < 0.1 then look = Vector3.new(0, 0, -1) end
+    look = look.Unit
+    for i = 0, 7 do
+        local a = math.rad(45 * i)
+        local dir = Vector3.new(look.X * math.cos(a) - look.Z * math.sin(a), 0, look.X * math.sin(a) + look.Z * math.cos(a))
+        local ground = groundAt(origin.Position + dir * dist, origin.Position.Y)
+        if ground then
+            local pos = ground + Vector3.new(0, 3, 0)
+            return CFrame.lookAt(pos, pos + dir)
         end
     end
-    local pos = pivotOf(model)
-    if not pos then return nil end
-    local best, bestDist = nil, 20
-    for _, anchor in ipairs(workspace:GetChildren()) do
-        if anchor.Name == "PromptAnchor" and anchor:IsA("BasePart") then
-            local prompt = anchor:FindFirstChild("StealPrompt")
-            if prompt and prompt:IsA("ProximityPrompt") then
-                local d = (anchor.Position - pos).Magnitude
-                if d < bestDist then best, bestDist = prompt, d end
-            end
-        end
-    end
-    if best and best.Enabled and not reservedForOther(best) then return best end
     return nil
 end
 
-local function firePrompt(prompt)
-    if type(fireproximityprompt) == "function" then
-        if pcall(fireproximityprompt, prompt) then return true end
+-- after arriving: stay unhidden for `seconds` and see whether something moves you away
+local WATCH_TIME, WATCH_LIMIT = 2, 8
+local function watch(target, origin, token, seconds)
+    local t0 = os.clock()
+    local worst, at = 0, nil
+    while labRunning(token) and os.clock() - t0 < (seconds or WATCH_TIME) do
+        local hum, root = getHumanoid(), getRoot()
+        if not hum or hum.Health <= 0 or not root then return { died = true } end
+        local d = (root.Position - target.Position).Magnitude
+        if d > worst then
+            worst = d
+            if d > WATCH_LIMIT and not at then at = os.clock() - t0 end
+        end
+        RunService.Heartbeat:Wait()
     end
-    return pcall(function()
-        prompt:InputHoldBegin()
-        task.wait((prompt.HoldDuration or 0) + 0.1)
-        prompt:InputHoldEnd()
-    end)
-end
-
----------------------------------------------------------------- auto farm
-local Farm = { On = false, Token = 0, Stats = { Broken = 0, Grabbed = 0, Banked = 0 } }
-local setStatus -- set by the UI
-
-local function status(text)
-    if setStatus then setStatus(text) end
-end
-
-local function running(token) return App.Alive and Farm.On and Farm.Token == token end
-
-local SWING_DELAY = 1     -- seconds to wait next to an egg (still flung) before anything else
-local HIT_RANGE = 8        -- the game's EggConfig.HitRange (from the egg's surface)
-local HATCH_TIMEOUT = 20   -- the hatch animation plays before the animal spawns
-
--- distance from a point to the egg's surface, like the game's EggTargeting.SurfaceDistance
-local function surfaceDistance(egg, pos)
-    local size = egg.Size
-    local d = pos - egg.Position
-    local h = math.max(flat(d).Magnitude - math.max(size.X, size.Z) / 2, 0)
-    local v = math.max(math.abs(d.Y) - size.Y / 2, 0)
-    return math.sqrt(h * h + v * v)
-end
-
-local function rootDistance(egg)
     local root = getRoot()
-    return root and surfaceDistance(egg, root.Position) or math.huge
+    local toStart = (root and origin) and (root.Position - origin.Position).Magnitude or nil
+    return { ok = worst <= WATCH_LIMIT, worst = worst, at = at, backToStart = toStart ~= nil and toStart < 15 }
 end
 
--- walk (no fling) towards pos until done() or timeout
-local function walkTo(pos, token, timeout, done)
-    local t = os.clock()
-    while running(token) and alive() and os.clock() - t < timeout do
-        if done() then return true end
-        local hum = getHumanoid()
-        if hum then pcall(hum.MoveTo, hum, pos) end
-        task.wait(0.1)
+local function describe(r)
+    if not r then return "skipped" end
+    if r.noGround then return "no ground there" end
+    if r.died then return "<font color='#ff6b6b'>DIED</font>" end
+    if r.ok then return "<font color='#6be08a'>ok</font>" end
+    return ("<font color='#ffb347'>BACK</font> %d studs%s after %.1fs"):format(
+        math.floor(r.worst), r.backToStart and " (to start)" or "", r.at or 0)
+end
+local function short(r)
+    if not r or r.noGround then return " -- " end
+    if r.died then return "DIED" end
+    return r.ok and " ok " or "BACK"
+end
+
+-- glide along points at `speed` studs/s (not hidden), one small step per frame
+local function glidePath(points, speed, token)
+    for i = 2, #points do
+        local from, to = points[i - 1], points[i]
+        local dist = (to - from).Magnitude
+        local t0 = os.clock()
+        while labRunning(token) do
+            local root = getRoot()
+            if not root then return false end
+            local k = dist > 0 and math.min((os.clock() - t0) * speed / dist, 1) or 1
+            markOwn()
+            zeroMotion(root)
+            root.CFrame = CFrame.new(from:Lerp(to, k))
+            if k >= 1 then break end
+            RunService.Stepped:Wait()
+        end
     end
-    return done()
+    return labRunning(token)
 end
 
-local function eggBroke(egg)
-    return egg.Parent == nil or attr(egg, "Broken") == true or attr(egg, "Hatching") == true
-        or num(egg, "Health", 1) <= 0
-end
-
--- stop flinging, walk out of dig reach, walk back next to the egg
-local function walkOutAndBack(egg, token)
-    unhide()
+-- go to target with a method: "Plain", "Ghost", "Fling", or "Glide"
+local function travel(method, target, token, opts)
+    opts = opts or {}
     local root = getRoot()
     if not root then return false end
-    local dir = flat(root.Position - egg.Position)
-    dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(1, 0, 0)
-    local reach = math.max(egg.Size.X, egg.Size.Z) / 2
-    local out = egg.Position + dir * (reach + HIT_RANGE + 6)
-    out = Vector3.new(out.X, root.Position.Y, out.Z)
-    status("Walking out of dig reach")
-    walkTo(out, token, 4, function() return rootDistance(egg) > HIT_RANGE + 2 end)
-    if not running(token) or not isLive(egg) then return false end
-    status("Walking back to the egg")
-    local back = besideEgg(egg)
-    if not walkTo(back.Position, token, 4, function() return rootDistance(egg) <= HIT_RANGE - 3 end) then
-        -- stuck: small step back next to it
-        local r = getRoot()
-        if r then r.CFrame = back end
+    if method == "Plain" then
+        markOwn()
+        zeroMotion(root)
+        root.CFrame = target
+        RunService.Stepped:Wait()
+    elseif method == "Glide" then
+        glidePath({ root.Position, target.Position }, opts.speed or 300, token)
+    else
+        local m = method == "Fling" and Fling or Ghost
+        if (m == Fling and Ghost.On) or (m == Ghost and Fling.On) then stopMovers() end
+        m.TP(target, opts.warmup)
+        unhide()
     end
-    return running(token) and isLive(egg)
+    return labRunning(token)
 end
 
--- break one egg. true when it broke (the game marks it Hatching / Broken)
-local function breakEgg(egg, token)
-    status("Going to " .. (egg.Parent and egg.Parent.Name or "egg"))
-    if not moverTP(besideEgg(egg)) then return false end
-    keepAutoSwingOff()
-    equipPickaxe()
-    -- arrived: hold still (flung) for a second before anything else
-    local arrived = os.clock()
-    while running(token) and isLive(egg) and os.clock() - arrived < SWING_DELAY do
-        local m = Mover()
-        if m.On then m.Hold = besideEgg(egg) end
-        task.wait(0.1)
+-- one trial: from where you stand, go `dist` studs with `method`, watch, come back
+local function trial(method, dist, token, opts)
+    local root = getRoot()
+    if not root then return { died = true } end
+    if (method == "Ghost" or method == "Fling") and leavePlot then leavePlot() end
+    root = getRoot()
+    local origin = root.CFrame
+    local target = findTarget(origin, dist)
+    if not target then return { noGround = true } end
+    travel(method, target, token, opts)
+    local r = watch(target, origin, token)
+    if r.died then
+        -- wait for the respawn before the next trial
+        local t = os.clock()
+        while labRunning(token) and not (getHumanoid() and getHumanoid().Health > 0) and os.clock() - t < 10 do task.wait(0.5) end
+        task.wait(1)
+        return r
     end
-    if Settings.WalkOutFirst then
-        if not walkOutAndBack(egg, token) then return eggBroke(egg) end
+    -- come back the same way (not judged), then rest a moment
+    if labRunning(token) then
+        local now = getRoot()
+        if now and (now.Position - origin.Position).Magnitude > WATCH_LIMIT then travel(method, origin, token, opts) end
+        task.wait(1)
     end
-    -- the server must see you next to the egg to count hits: no ghost while mining
-    if Ghost.On then unhide() end
-    status("Mining " .. (egg.Parent and egg.Parent.Name or "egg"))
-    local lastHp, lastChange = num(egg, "Health", 0), os.clock()
-    local cooldown = swingCooldown()
-    while running(token) and isLive(egg) and alive() do
-        if Fling.On then
-            Fling.Hold = besideEgg(egg)
-        elseif rootDistance(egg) > HIT_RANGE - 2 then
-            -- got pushed away: walk back into reach
-            walkTo(besideEgg(egg).Position, token, 3, function() return rootDistance(egg) <= HIT_RANGE - 3 end)
-        end
-        keepAutoSwingOff()
-        if not equipPickaxe() then
-            status("No Pickaxe in your backpack")
-            task.wait(1)
-            return false
-        end
-        hitEgg(egg)
-        task.wait(cooldown)
-        local hp = num(egg, "Health", lastHp)
-        if hp < lastHp then lastHp, lastChange = hp, os.clock() end
-        if os.clock() - lastChange > 6 and not eggBroke(egg) then
-            status("Egg isn't taking damage, skipping it")
-            Skip[egg] = true
-            return false
-        end
-    end
-    return eggBroke(egg)
+    return r
 end
 
--- wait for the hatch animation, then grab the animal. true when CarryCount went up
-local function grabAnimal(hatchId, eggPos, token)
-    status("Egg hatching, waiting for the animal")
-    local before = carrying()
-    local t = os.clock()
-    while running(token) and alive() and os.clock() - t < HATCH_TIMEOUT do
-        local animal = pickupFor(hatchId, eggPos)
-        local prompt = animal and promptFor(animal)
-        if animal and prompt then
-            status("Grabbing " .. animal.Name)
-            local pos = pivotOf(animal)
-            if pos then
-                local root = getRoot()
-                local dir = root and flat(root.Position - pos) or Vector3.zero
-                dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(1, 0, 0)
-                local stand = pos + dir * 3
-                moverTP(CFrame.lookAt(stand, Vector3.new(pos.X, stand.Y, pos.Z)))
-                -- the server must see you next to the animal: no ghost while grabbing
-                if Ghost.On then unhide() end
-                firePrompt(prompt)
-                local w = os.clock()
-                while os.clock() - w < 0.8 and carrying() <= before and animal.Parent do task.wait(0.1) end
-                if carrying() > before then return true end
+---------------------------------------------------------------- live snap-back watcher
+local Snap = { Events = {}, Count = 0 }
+local snapChanged -- set by the UI
+do
+    local last
+    track(RunService.Heartbeat:Connect(function()
+        local root = getRoot()
+        if not root then last = nil return end
+        -- read before the movers hide anything (they act after this on Heartbeat too,
+        -- so skip hidden frames entirely)
+        if hidden() then last = nil return end
+        local pos = root.Position
+        if last and Settings.Watch and os.clock() > ownMoveUntil then
+            local jump = (pos - last).Magnitude
+            if jump > WATCH_LIMIT then
+                Snap.Count += 1
+                table.insert(Snap.Events, 1, ("%s  moved %d studs in one frame"):format(os.date and os.date("%H:%M:%S") or "", math.floor(jump)))
+                if #Snap.Events > 8 then table.remove(Snap.Events) end
+                if snapChanged then task.defer(snapChanged) end
             end
         end
-        task.wait(0.15)
-    end
-    if carrying() <= before then status("Animal never showed up") end
-    return carrying() > before
-end
-
--- stay flung all the way back, land just OUTSIDE the plot, stop flinging, walk in to bank
-local function goHome(token)
-    local spot, hb = outsidePlotCFrame()
-    if not spot then
-        status("Can't find your plot")
-        task.wait(1)
-        return false
-    end
-    status(Mover().Name .. " home (outside the plot)")
-    moverTP(spot)
-    task.wait(0.25)
-    local hum = getHumanoid()
-    -- start walking in on the same frame the fling ends
-    local walk = Settings.WalkInToBank and carrying() > 0
-    if walk and hum then pcall(hum.MoveTo, hum, plotWalkTarget(hb)) end
-    stopMovers()
-    if carrying() == 0 then return true end
-    if not walk then
-        status("Outside your plot. Walk in to bank")
-        return false
-    end
-    status("Walking in to bank")
-    local carried = carrying()
-    local t = os.clock()
-    while running(token) and carrying() > 0 and os.clock() - t < 8 do
-        if hum then pcall(hum.MoveTo, hum, plotWalkTarget(hb)) end
-        task.wait(0.25)
-    end
-    -- banked: stop walking (stay near the edge of the plot)
-    local r = getRoot()
-    if hum and r then pcall(hum.MoveTo, hum, r.Position) end
-    local banked = carried - carrying()
-    if banked > 0 then Farm.Stats.Banked += banked end
-    return carrying() == 0
-end
-
-local function farmStep(token)
-    if not alive() then
-        stopMovers()
-        status("Waiting for your character")
-        task.wait(1)
-        return
-    end
-    if carrying() >= capacity() then
-        goHome(token)
-        return
-    end
-    local egg = pickEgg()
-    if not egg then
-        if carrying() > 0 then goHome(token) return end
-        status(Settings.Zone == 0 and "No eggs right now" or ("No eggs in zone " .. Settings.Zone))
-        task.wait(1)
-        return
-    end
-    local hatchId, eggPos = attr(egg, "HatchId"), egg.Position
-    if not breakEgg(egg, token) then return end
-    Farm.Stats.Broken += 1
-    hatchId = hatchId or attr(egg, "HatchId")
-    if not running(token) then return end
-    if grabAnimal(hatchId, eggPos, token) then
-        Farm.Stats.Grabbed += 1
-        if Settings.BankEachGrab or carrying() >= capacity() then goHome(token) end
-    end
-end
-
-function Farm.Start()
-    if Farm.On then return end
-    keepAutoSwingOff()
-    Farm.On = true
-    Farm.Token += 1
-    local token = Farm.Token
-    task.spawn(function()
-        while running(token) do
-            local ok, err = pcall(farmStep, token)
-            if not ok then
-                status("Error: " .. tostring(err):sub(1, 80))
-                task.wait(1)
-            end
-            task.wait(0.1)
-        end
-    end)
-end
-
-function Farm.Stop()
-    Farm.On = false
-    Farm.Token += 1
-    stopMovers()
-    status("Idle")
+        last = pos
+    end))
 end
 
 ---------------------------------------------------------------- UI
@@ -845,7 +583,7 @@ local cam = workspace.CurrentCamera
 local viewport = cam and cam.ViewportSize or Vector2.new(1280, 720)
 new("UIScale", { Scale = math.min(viewport.X, viewport.Y) < 500 and 0.85 or 1, Parent = gui })
 
-local WIDTH, HEIGHT = 290, 340
+local WIDTH, HEIGHT = 310, 380
 local main = new("Frame", {
     Name = "Main",
     Size = UDim2.fromOffset(WIDTH, HEIGHT),
@@ -904,13 +642,18 @@ local openButton = new("TextButton", {
     Parent = gui,
 }, { corner(24) })
 
--- tabs
-local tabBar = new("Frame", {
+-- tabs (scroll sideways when they don't fit)
+local tabBar = new("ScrollingFrame", {
     BackgroundTransparency = 1,
+    BorderSizePixel = 0,
     Position = UDim2.fromOffset(10, 44),
-    Size = UDim2.new(1, -20, 0, 30),
+    Size = UDim2.new(1, -20, 0, 34),
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.X,
+    ScrollingDirection = Enum.ScrollingDirection.X,
+    ScrollBarThickness = 3,
     Parent = main,
-}, { new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }) })
+}, { new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }) })
 
 local pages, tabButtons = {}, {}
 local function showPage(name)
@@ -923,8 +666,8 @@ local function makePage(name)
         Name = name,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
-        Position = UDim2.fromOffset(10, 80),
-        Size = UDim2.new(1, -20, 1, -90),
+        Position = UDim2.fromOffset(10, 84),
+        Size = UDim2.new(1, -20, 1, -94),
         CanvasSize = UDim2.new(),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollBarThickness = 4,
@@ -935,10 +678,11 @@ local function makePage(name)
     local b = new("TextButton", {
         Text = name,
         Font = Enum.Font.GothamBold,
-        TextSize = 14,
+        TextSize = 13,
         TextColor3 = Theme.Text,
         BackgroundColor3 = Theme.Item,
-        Size = UDim2.fromOffset(80, 30),
+        Size = UDim2.fromOffset(66, 28),
+        LayoutOrder = #tabBar:GetChildren(),
         Parent = tabBar,
     }, { corner(6) })
     tabButtons[name] = b
@@ -979,7 +723,7 @@ local function button(page, text, color, onClick)
     }, { corner(8) })
     b.MouseButton1Click:Connect(function()
         local ok, err = pcall(onClick, b)
-        if not ok then status("Error: " .. tostring(err):sub(1, 80)) end
+        if not ok then warn("[SmurfySimple] " .. tostring(err)) end
     end)
     return b
 end
@@ -1076,133 +820,267 @@ minimizeButton.MouseButton1Click:Connect(function()
 end)
 
 ---------------------------------------------------------------- pages
+-- a results box (monospace) for a test page
+local function resultsBox(page)
+    local l = label(page, "")
+    l.Font = Enum.Font.Code
+    l.TextColor3 = Theme.Text
+    return function(text) l.Text = text end
+end
+
+-- the usual Run / Stop pair; run(token, out) does the test
+local function runStop(page, runText, out, run)
+    button(page, runText, Theme.On, function()
+        runLab(function(token) run(token, out) end, out)
+    end)
+    button(page, "Stop", Theme.Danger, function()
+        stopLab()
+        out("Stopped.")
+    end)
+end
+
+local function pickCycle(page, prefix, key, options, fmt)
+    return cycle(page, function()
+        return prefix .. (fmt and fmt(Settings[key]) or tostring(Settings[key]))
+    end, function()
+        local idx = table.find(options, Settings[key]) or 0
+        Settings[key] = options[idx % #options + 1]
+        saveSettings()
+    end)
+end
+
 local mainPage = makePage("Main")
-local testPage = makePage("Test")
+local snapPage = makePage("Snap")
+local ladderPage = makePage("Ladder")
+local methodsPage = makePage("Methods")
+local warmupPage = makePage("Warmup")
+local glidePage = makePage("Glide")
+local endurePage = makePage("Endure")
+local underPage = makePage("Under")
 
-label(mainPage, "Drag the top bar to move. <b>–</b> hides the window (tap <b>S</b> to bring it back).")
+---------------- Main
+label(mainPage, "Movement Lab. Each tab is one test: stand somewhere open, press its green button, then send the results.\nDrag the top bar to move. <b>–</b> hides the window (tap <b>S</b> to bring it back).")
 local unload -- defined below
-
 button(mainPage, "Restore settings", Theme.Item, function()
-    Farm.Stop()
-    stopMovers()
+    stopLab()
     Settings = table.clone(Defaults)
-    table.clear(Skip)
     pcall(function() if type(delfile) == "function" and isfile(CONFIG_FILE) then delfile(CONFIG_FILE) end end)
     saveSettings()
-    local hum = getHumanoid()
-    if hum then pcall(hum.ChangeState, hum, Enum.HumanoidStateType.GettingUp) end
     main.Position = UDim2.fromOffset(Defaults.WindowX, Defaults.WindowY)
     refreshAll()
-    status("Settings restored")
 end)
 button(mainPage, "Unload", Theme.Danger, function() unload() end)
 
--- Test page
-local statusLabel = label(testPage, "Idle")
-setStatus = function(text)
-    local s = Farm.Stats
-    statusLabel.Text = ("<b>%s</b>\nBroken %d · Grabbed %d · Banked %d · Carrying %d/%d"):format(
-        text, s.Broken, s.Grabbed, s.Banked, carrying(), capacity())
+---------------- Snap
+label(snapPage, "<b>Snap-back watcher</b>: while on, any time something moves you more than 8 studs in one frame (not this script), it's listed here. That's what a server pull-back looks like.")
+toggle(snapPage, "Watch for snap-backs", function() return Settings.Watch end, function(v)
+    Settings.Watch = v
+    saveSettings()
+end)
+local snapOut = resultsBox(snapPage)
+snapChanged = function()
+    snapOut(("Seen: %d\n%s"):format(Snap.Count, #Snap.Events > 0 and table.concat(Snap.Events, "\n") or "(nothing yet)"))
 end
-setStatus("Idle")
-
-toggle(testPage, "Auto farm", function() return Farm.On end, function(v)
-    if v then Farm.Start() else Farm.Stop() end
+snapChanged()
+button(snapPage, "Clear list", nil, function()
+    table.clear(Snap.Events)
+    Snap.Count = 0
+    snapChanged()
+end)
+local snapCheck = resultsBox(snapPage)
+runStop(snapPage, "Quick check: plain TP 50 studs", snapCheck, function(token, out)
+    out("Teleporting 50 studs and watching for 2 s...")
+    local r = trial("Plain", 50, token)
+    out("Plain TP 50 studs: " .. describe(r) .. "\nDone.")
 end)
 
-cycle(testPage, function()
-    return "Method: " .. (Settings.Method == "Fling" and "Fling (huge speed)" or "Ghost (far away)")
-end, function()
-    stopMovers()
-    Settings.Method = Settings.Method == "Fling" and "Ghost" or "Fling"
-    saveSettings()
-    refreshAll()
-end)
-
-cycle(testPage, function()
-    return "Zone: " .. (Settings.Zone == 0 and "Any (nearest)" or tostring(Settings.Zone))
-end, function()
-    Settings.Zone = (Settings.Zone + 1) % 10
-    table.clear(Skip)
-    saveSettings()
-end)
-
-cycle(testPage, function()
-    return "Fling power: " .. (FlingPowers[Settings.FlingLevel] or FlingPowers[#FlingPowers])[1]
-end, function()
-    Settings.FlingLevel = Settings.FlingLevel % #FlingPowers + 1
-    saveSettings()
-end)
-
-toggle(testPage, "Bank after every grab", function() return Settings.BankEachGrab end, function(v)
-    Settings.BankEachGrab = v
-    saveSettings()
-end)
-
-toggle(testPage, "Walk out & back before mining", function() return Settings.WalkOutFirst end, function(v)
-    Settings.WalkOutFirst = v
-    saveSettings()
-end)
-
-toggle(testPage, "Walk in to bank", function() return Settings.WalkInToBank end, function(v)
-    Settings.WalkInToBank = v
-    saveSettings()
-end)
-
-label(testPage, "<b>Manual tests</b>")
-
-toggle(testPage, "Hide in place (stand still)", hidden, function(v)
-    if v then
-        leavePlot() -- not on the plot
-        Mover().Start()
-    else
-        stopMovers()
+---------------- Ladder
+label(ladderPage, "<b>Plain TP ladder</b>: a normal teleport (no hiding) at 10, 25, 50, 100, 250, 500, 1000 studs. Shows where the server starts pulling you back.")
+local ladderOut = resultsBox(ladderPage)
+runStop(ladderPage, "Run ladder", ladderOut, function(token, out)
+    local lines = {}
+    for _, d in ipairs({ 10, 25, 50, 100, 250, 500, 1000 }) do
+        if not labRunning(token) then return end
+        out(table.concat(lines, "\n") .. ("\n%5d studs: testing..."):format(d))
+        local r = trial("Plain", d, token)
+        table.insert(lines, ("%5d studs: %s"):format(d, describe(r)))
     end
-    status(v and (Mover().Name .. " in place") or "Idle")
+    out(table.concat(lines, "\n") .. "\nDone.")
 end)
 
-button(testPage, "TP → nearest egg", nil, function()
-    local egg = pickEgg()
-    if not egg then return status("No egg found") end
-    task.spawn(function()
-        moverTP(besideEgg(egg))
-        status("Holding next to the egg (still hidden)")
-        refreshAll()
-    end)
-end)
-
-button(testPage, "TP → outside my plot", nil, function()
-    local spot = outsidePlotCFrame()
-    if not spot then return status("Can't find your plot") end
-    task.spawn(function()
-        moverTP(spot)
-        task.wait(0.25)
-        stopMovers()
-        status("Outside your plot")
-        refreshAll()
-    end)
-end)
-
-button(testPage, "Stop everything", Theme.Danger, function()
-    Farm.Stop()
-    refreshAll()
-end)
-
-showPage("Test")
-
--- keep the status line fresh
-task.spawn(function()
-    while App.Alive do
-        if statusLabel.Parent then
-            local first = statusLabel.Text:match("^<b>(.-)</b>") or "Idle"
-            setStatus(first)
+---------------- Methods
+label(methodsPage, "<b>Method showdown</b>: Plain TP, Ghost TP, Fling TP and a 300 studs/s glide, each at 50, 250 and 1000 studs. Takes about a minute.")
+local methodsOut = resultsBox(methodsPage)
+local METHODS = { "Plain", "Ghost", "Fling", "Glide" }
+runStop(methodsPage, "Run showdown", methodsOut, function(token, out)
+    local grid = {}
+    local function render(extra)
+        local rows = { "studs  Plain Ghost Fling Glide" }
+        for _, d in ipairs({ 50, 250, 1000 }) do
+            local row = ("%5d "):format(d)
+            for _, m in ipairs(METHODS) do
+                local r = grid[d .. m]
+                row ..= " " .. (r == nil and "  .  " or ("%-5s"):format(short(r)))
+            end
+            table.insert(rows, row)
         end
-        task.wait(0.5)
+        out(table.concat(rows, "\n") .. (extra and ("\n" .. extra) or ""))
     end
+    for _, d in ipairs({ 50, 250, 1000 }) do
+        for _, m in ipairs(METHODS) do
+            if not labRunning(token) then return end
+            render(("testing %s %d..."):format(m, d))
+            grid[d .. m] = trial(m, d, token, { speed = 300 })
+        end
+    end
+    render("ok = stayed, BACK = pulled back, -- = no ground\nDone.")
 end)
+
+---------------- Warmup
+label(warmupPage, "<b>Warmup tuner</b>: how long you're hidden before the jump. Tries none, 1 frame, 0.05, 0.15 and 0.5 s (2 tries each) and keeps the shortest that always worked.")
+pickCycle(warmupPage, "Method: ", "WarmupMethod", { "Ghost", "Fling" })
+pickCycle(warmupPage, "Distance: ", "WarmupDist", { 100, 250, 500, 1000 }, function(v) return v .. " studs" end)
+cycle(warmupPage, function() return ("Current warmup: %s"):format(Settings.Warmup < 0 and "1 frame" or (Settings.Warmup .. " s")) end, function() end)
+local warmupOut = resultsBox(warmupPage)
+local WARMUPS = { { "none", 0 }, { "1 frame", -1 }, { "0.05 s", 0.05 }, { "0.15 s", 0.15 }, { "0.5 s", 0.5 } }
+runStop(warmupPage, "Run warmup test", warmupOut, function(token, out)
+    local lines, best = {}, nil
+    for _, w in ipairs(WARMUPS) do
+        local good = 0
+        for try = 1, 2 do
+            if not labRunning(token) then return end
+            out(table.concat(lines, "\n") .. ("\n%-8s try %d..."):format(w[1], try))
+            local r = trial(Settings.WarmupMethod, Settings.WarmupDist, token, { warmup = w[2] })
+            if r.ok then good += 1 end
+        end
+        table.insert(lines, ("%-8s %d/2 ok"):format(w[1], good))
+        if good == 2 and not best then best = w end
+    end
+    if best then
+        Settings.Warmup = best[2]
+        saveSettings()
+        refreshAll()
+        table.insert(lines, "Best: " .. best[1] .. " (now used for Ghost / Fling TPs)")
+    else
+        table.insert(lines, "None worked every time. Warmup left as it was.")
+    end
+    out(table.concat(lines, "\n") .. "\nDone.")
+end)
+
+---------------- Glide
+label(glidePage, "<b>Glide speed finder</b>: slides you there (not hidden) at 100, 300, 1000, 3000 and 10000 studs/s and shows the fastest the server accepts.")
+pickCycle(glidePage, "Distance: ", "GlideDist", { 100, 250, 500 }, function(v) return v .. " studs" end)
+local glideOut = resultsBox(glidePage)
+runStop(glidePage, "Run glide test", glideOut, function(token, out)
+    local lines, fastest = {}, nil
+    for _, speed in ipairs({ 100, 300, 1000, 3000, 10000 }) do
+        if not labRunning(token) then return end
+        out(table.concat(lines, "\n") .. ("\n%6d/s: testing..."):format(speed))
+        local r = trial("Glide", Settings.GlideDist, token, { speed = speed })
+        table.insert(lines, ("%6d/s: %s"):format(speed, describe(r)))
+        if r.ok then fastest = speed end
+    end
+    table.insert(lines, fastest and ("Fastest ok: " .. fastest .. " studs/s") or "No speed worked.")
+    out(table.concat(lines, "\n") .. "\nDone.")
+end)
+
+---------------- Endure
+label(endurePage, "<b>Hide endurance</b>: stays hidden in place for 5, 15, 30 and 60 s, then checks whether you died or got pulled when you come back. About 2 minutes.")
+pickCycle(endurePage, "Method: ", "EndureMethod", { "Ghost", "Fling" })
+local endureOut = resultsBox(endurePage)
+runStop(endurePage, "Run endurance", endureOut, function(token, out)
+    local lines = {}
+    for _, secs in ipairs({ 5, 15, 30, 60 }) do
+        if not labRunning(token) then return end
+        if leavePlot then leavePlot() end
+        local root = getRoot()
+        if not root then return end
+        local spot = root.CFrame
+        local m = Settings.EndureMethod == "Fling" and Fling or Ghost
+        m.Start(spot)
+        local t0, died = os.clock(), false
+        while labRunning(token) and os.clock() - t0 < secs do
+            local hum = getHumanoid()
+            if not hum or hum.Health <= 0 then died = true break end
+            out(table.concat(lines, "\n") .. ("\n%2d s: hidden, %d s left"):format(secs, math.ceil(secs - (os.clock() - t0))))
+            task.wait(0.25)
+        end
+        unhide()
+        local r
+        if died then
+            r = { died = true }
+            local t = os.clock()
+            while labRunning(token) and not (getHumanoid() and getHumanoid().Health > 0) and os.clock() - t < 10 do task.wait(0.5) end
+        else
+            r = watch(spot, spot, token)
+        end
+        table.insert(lines, ("%2d s: %s"):format(secs, describe(r)))
+        task.wait(2)
+    end
+    out(table.concat(lines, "\n") .. "\nDone.")
+end)
+
+---------------- Under
+label(underPage, "<b>Under-the-map route</b>: drops below the floor, glides under the map (no collisions) and comes up at the target. Never goes deeper than the game's kill height allows.")
+pickCycle(underPage, "Depth: ", "UnderDepth", { 20, 50, 100 }, function(v) return v .. " studs under" end)
+pickCycle(underPage, "Distance: ", "UnderDist", { 100, 250, 500 }, function(v) return v .. " studs" end)
+pickCycle(underPage, "Speed: ", "UnderSpeed", { 300, 1000 }, function(v) return v .. " studs/s" end)
+local underOut = resultsBox(underPage)
+
+local function underTrial(depth, dist, speed, token)
+    local root = getRoot()
+    if not root then return { died = true } end
+    local origin = root.CFrame
+    local target = findTarget(origin, dist)
+    if not target then return { noGround = true } end
+    local floorY = math.min(origin.Position.Y, target.Position.Y) - 3
+    local killY = (workspace.FallenPartsDestroyHeight or -500) + 50
+    local y = math.max(floorY - depth, killY)
+    noclip(true)
+    glidePath({
+        origin.Position,
+        Vector3.new(origin.Position.X, y, origin.Position.Z),
+        Vector3.new(target.Position.X, y, target.Position.Z),
+        target.Position,
+    }, speed, token)
+    noclip(false)
+    local r = watch(target, origin, token)
+    if not r.died and labRunning(token) then
+        local now = getRoot()
+        if now and (now.Position - origin.Position).Magnitude > WATCH_LIMIT then
+            noclip(true)
+            glidePath({ now.Position, Vector3.new(now.Position.X, y, now.Position.Z),
+                Vector3.new(origin.Position.X, y, origin.Position.Z), origin.Position }, speed, token)
+            noclip(false)
+        end
+        task.wait(1)
+    end
+    return r
+end
+
+runStop(underPage, "Run once (settings above)", underOut, function(token, out)
+    out("Going under...")
+    local r = underTrial(Settings.UnderDepth, Settings.UnderDist, Settings.UnderSpeed, token)
+    out(("%d under, %d studs, %d/s: %s\nDone."):format(Settings.UnderDepth, Settings.UnderDist, Settings.UnderSpeed, describe(r)))
+end)
+button(underPage, "Run all depths", Theme.On, function()
+    runLab(function(token)
+        local lines = {}
+        for _, depth in ipairs({ 20, 50, 100 }) do
+            if not labRunning(token) then return end
+            underOut(table.concat(lines, "\n") .. ("\n%3d under: testing..."):format(depth))
+            local r = underTrial(depth, Settings.UnderDist, Settings.UnderSpeed, token)
+            table.insert(lines, ("%3d under: %s"):format(depth, describe(r)))
+        end
+        underOut(table.concat(lines, "\n") .. "\nDone.")
+    end, underOut)
+end)
+
+showPage("Main")
 
 track(LocalPlayer.CharacterAdded:Connect(function()
     stopMovers()
+    noclip(false)
     refreshAll()
 end))
 
@@ -1210,8 +1088,7 @@ end))
 unload = function()
     if not App.Alive then return end
     App.Alive = false
-    Farm.Stop()
-    stopMovers()
+    stopLab()
     removeGhostHook()
     for _, c in ipairs(App.Conns) do pcall(function() c:Disconnect() end) end
     table.clear(App.Conns)

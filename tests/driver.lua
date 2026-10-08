@@ -1,146 +1,155 @@
--- Runs SmurfySimple.lua in the fake game and checks it.
+-- Runs SmurfySimple.lua (Movement Lab) against the fake server in fake_game.lua.
 local failures = 0
 local function check(cond, what)
     print((cond and "  PASS  " or "  FAIL  ") .. what)
     if not cond then failures += 1 end
 end
-local function buttonStarting(text)
+local function page(name)
     for _, i in ipairs(__all()) do
-        if i.ClassName == "TextButton" and i.Parent and type(i.Text) == "string" and i.Text:sub(1, #text) == text then return i end
+        if i.ClassName == "ScrollingFrame" and i.Name == name and i.Parent then return i end
     end
 end
-local function click(text)
-    local b = buttonStarting(text)
-    if not b then print("  !! no button: " .. text) return false end
-    b.MouseButton1Click:Fire()
-    __runFrames(2)
-    return true
+local function clickIn(pageName, text)
+    local p = page(pageName)
+    for _, i in ipairs(p and p:GetChildren() or {}) do
+        if i.ClassName == "TextButton" and type(i.Text) == "string" and i.Text:sub(1, #text) == text then
+            i.MouseButton1Click:Fire()
+            __runFrames(2)
+            return true
+        end
+    end
+    print("  !! no button on " .. pageName .. ": " .. text)
+    return false
 end
-
--- one egg for the manual tests; each farm round spawns its own (see farmRound)
-__SG.spawnEgg(2, "Swamp Egg", Vector3.new(-620, 2.5, 40), 3)
+local function results(pageName)
+    local out = {}
+    for _, i in ipairs(page(pageName):GetChildren()) do
+        if i.ClassName == "TextLabel" and i.Font == Enum.Font.Code then table.insert(out, i.Text) end
+    end
+    return table.concat(out, "\n")
+end
+local function plain(t) return (t:gsub("<[^>]+>", "")) end
+-- run until the page says Done (or time runs out)
+local function waitDone(pageName, seconds)
+    for _ = 1, seconds * 10 do
+        __runFrames(6)
+        if results(pageName):find("Done%.") then return true end
+    end
+    return false
+end
+local function line(pageName, prefix)
+    for l in plain(results(pageName)):gmatch("[^\n]+") do
+        if l:find(prefix, 1, true) then return l end
+    end
+    return ""
+end
 
 local ok, err = xpcall(__main, debug.traceback)
 check(ok, "script loads" .. (ok and "" or (": " .. tostring(err))))
 if not ok then return end
 __runFrames(30)
-check(__SG.autoSwingOn() == false, "the game's Auto Swing is turned off on load")
-__SG.autoSwing.SetOn(true)
-__runFrames(5)
-check(__SG.autoSwingOn() == false, "...and turned back off if something switches it on")
 
-for _, text in ipairs({ "Restore settings", "Unload", "Auto farm", "Zone: ", "Method: Ghost", "Fling power: ",
-    "Hide in place", "TP → nearest egg", "TP → outside my plot" }) do
-    check(buttonStarting(text) ~= nil, "button: " .. text)
+for _, name in ipairs({ "Main", "Snap", "Ladder", "Methods", "Warmup", "Glide", "Endure", "Under" }) do
+    check(page(name) ~= nil, "tab: " .. name)
+end
+for _, i in ipairs(__all()) do
+    if i.ClassName == "TextButton" and i.Parent and type(i.Text) == "string" and (i.Text:find("Auto farm") or i.Text:find("Zone:")) then
+        check(false, "old farm button still there: " .. i.Text)
+    end
+end
+check(clickIn("Main", "Restore settings") and true, "Main has Restore settings")
+
+-- Snap: quick check (plain 50 studs) gets pulled back, and the watcher sees the pull
+clickIn("Snap", "Quick check")
+check(waitDone("Snap", 20), "snap quick check finishes")
+check(line("Snap", "Plain TP 50"):find("BACK") ~= nil, "plain TP 50 studs: pulled back -> " .. line("Snap", "Plain TP 50"))
+check(line("Snap", "Seen:"):match("Seen: (%d+)") ~= "0", "the watcher listed the pull back (" .. line("Snap", "Seen:") .. ")")
+
+-- Ladder: 10 ok, 25+ pulled back (fake server limit: 20 studs a frame)
+clickIn("Ladder", "Run ladder")
+check(waitDone("Ladder", 120), "ladder finishes")
+print(plain(results("Ladder")))
+check(line("Ladder", "   10 studs"):find("ok") ~= nil, "ladder 10: ok")
+for _, d in ipairs({ 25, 50, 100, 250, 500, 1000 }) do
+    check(line("Ladder", ("%5d studs"):format(d)):find("BACK") ~= nil, ("ladder %d: BACK"):format(d))
 end
 
-local function reset()
-    for _, k in ipairs({ "hits", "fastHits", "farHits", "unheldHits", "broken", "taken", "banked", "flungFrames",
-        "flungOnPlot", "bankedWhileFlung", "carriedUnflungOutside" }) do __SG[k] = 0 end
-    for _, k in ipairs({ "earlyHits", "flungHits", "noWalkOutHits", "jumps", "unflungJumps", "multiFrameTrips",
-        "maxSpeed", "ghostFrames", "takenNames", "notStillFrames" }) do __SG[k] = nil end
-    __SG.log = {}
+-- Methods
+clickIn("Methods", "Run showdown")
+check(waitDone("Methods", 240), "showdown finishes")
+print(plain(results("Methods")))
+for _, d in ipairs({ 50, 250, 1000 }) do
+    local cells = {}
+    for c in line("Methods", ("%5d "):format(d)):gmatch("%S+") do table.insert(cells, c) end
+    check(cells[2] == "BACK" and cells[3] == "ok" and cells[4] == "ok" and cells[5] == "ok",
+        ("showdown row %d: Plain BACK, Ghost/Fling/Glide ok (%s)"):format(d, table.concat(cells, " ")))
 end
 
--- manual: hide (ghost) in place keeps you still, server sees you far away
-check(__inHitbox(__root.Position), "test starts on the plot")
-click("Hide in place")
-__runFrames(60 * 5) -- walks off the plot first
-check(not __inHitbox(__root.Position), "hide in place walks off the plot first")
-check((__SG.unflungJumps or 0) == 0, "...walking, not a visible step")
-reset()
-local startPos = __root.Position
-__runFrames(120)
-check((__SG.ghostFrames or 0) >= 100, "ghost in place: the server sees you far away (" .. (__SG.ghostFrames or 0) .. " frames)")
-check((__root.Position - startPos).Magnitude < 0.01, "ghost in place: you stay still")
-check(not __SG.notStillFrames, "velocity zeroed before every physics step")
-click("Hide in place")
-__runFrames(10)
-local before = __SG.flungFrames
-__runFrames(30)
-check(__SG.flungFrames == before, "turning it off: the server sees you again")
+-- Warmup: none and 1 frame fail, 0.05 s is the shortest that works
+clickIn("Warmup", "Run warmup test")
+check(waitDone("Warmup", 240), "warmup test finishes")
+print(plain(results("Warmup")))
+check(line("Warmup", "none"):find("0/2") ~= nil, "warmup none: 0/2")
+check(line("Warmup", "1 frame"):find("0/2") ~= nil, "warmup 1 frame: 0/2")
+check(line("Warmup", "0.05 s"):find("2/2") ~= nil, "warmup 0.05 s: 2/2")
+check(line("Warmup", "Best:"):find("0.05") ~= nil, "best warmup picked: 0.05 s")
+local warmupButtonOk = false
+for _, i in ipairs(page("Warmup"):GetChildren()) do
+    if i.ClassName == "TextButton" and i.Text == "Current warmup: 0.05 s" then warmupButtonOk = true end
+end
+check(warmupButtonOk, "warmup setting now 0.05 s")
 
--- manual: TP outside plot lands outside, not hidden
-click("TP → outside my plot")
+-- Glide: up to 1000/s ok (fake limit 1200/s)
+clickIn("Glide", "Run glide test")
+check(waitDone("Glide", 120), "glide test finishes")
+print(plain(results("Glide")))
+check(line("Glide", "Fastest ok:"):find("1000") ~= nil, "fastest glide: 1000 studs/s")
+check(line("Glide", " 3000/s"):find("BACK") ~= nil, "3000/s pulled back")
+
+-- Endure: dies after 40 s hidden
+clickIn("Endure", "Run endurance")
+check(waitDone("Endure", 200), "endurance finishes")
+print(plain(results("Endure")))
+for _, s in ipairs({ " 5 s", "15 s", "30 s" }) do check(line("Endure", s):find("ok") ~= nil, "endure" .. s .. ": ok") end
+check(line("Endure", "60 s"):find("DIED") ~= nil, "endure 60 s: DIED")
+
+-- Under: default run works, never below the kill height margin
+local minY = math.huge
+local rsSig = __Signal
+local conn = game:GetService("RunService").Heartbeat:Connect(function() minY = math.min(minY, __root.Position.Y) end)
+clickIn("Under", "Run once")
+check(waitDone("Under", 60), "under route finishes")
+print(plain(results("Under")))
+check(line("Under", "50 under"):find("ok") ~= nil, "under route (50 under, 250 studs, 300/s): ok")
+check(minY < -40 and minY > -450, ("went under the floor but above the kill height (lowest y %.0f)"):format(minY))
+conn:Disconnect()
+
+-- Stop works mid-test and another test can start
+clickIn("Ladder", "Run ladder")
 __runFrames(60)
-check(not __inHitbox(__root.Position), ("outside-plot TP lands outside the hitbox (x=%.1f z=%.1f)"):format(__root.Position.X, __root.Position.Z))
-check(math.abs(__root.Position.X) < 60 and math.abs(__root.Position.Z) < 60, "...and right next to it")
-check(not __SG.lastFlung, "...and not hidden after landing")
+clickIn("Ladder", "Stop")
+__runFrames(30)
+check(plain(results("Ladder")):find("Stopped") ~= nil, "stop shows Stopped")
+clickIn("Snap", "Quick check")
+check(waitDone("Snap", 20), "a new test runs after Stop")
 
--- one auto farm round in zone 1 with the current method
-local round = 0
-local function farmRound(method)
-    round += 1
-    reset()
-    __SG.expectWalkOut = true
-    local z = 20 * round
-    __SG.spawnEgg(1, "Forest Egg", Vector3.new(-250, 2.5, z), 3)
-    __SG.spawnEgg(1, "Forest Egg", Vector3.new(-270, 2.5, z + 20), 3)
-    __SG.spawnEgg(1, "Rock Egg", Vector3.new(-290, 2.5, z - 20), 3)
-    __SG.dropAnimal(Vector3.new(-246, 2.5, z + 6), 900 + round, "Stray")
-    click("Auto farm")
-    __runFrames(60 * 120)
-    click("Auto farm")
-    __runFrames(30)
-    for _, line in ipairs(__SG.log) do print("    " .. line) end
-    local p = "[" .. method .. "] "
-    check(__SG.broken == 3, p .. "all 3 zone-1 eggs broken (" .. __SG.broken .. ")")
-    check((__SG.earlyHits or 0) == 0, p .. "waits 1 second next to each egg before swinging (" .. (__SG.earlyHits or 0) .. " early hits)")
-    check((__SG.flungHits or 0) == 0, p .. "mines while the server sees you (" .. (__SG.flungHits or 0) .. " hidden hits)")
-    check((__SG.noWalkOutHits or 0) == 0, p .. "walks out of dig reach and back before mining (" .. (__SG.noWalkOutHits or 0) .. " hits without)")
-    check((__SG.jumps or 0) >= 6, p .. "trips happened as jumps (" .. (__SG.jumps or 0) .. ")")
-    check((__SG.unflungJumps or 0) == 0, p .. "every jump is hidden the frame before and the frame of it (" .. (__SG.unflungJumps or 0) .. " not)")
-    check((__SG.multiFrameTrips or 0) == 0, p .. "each trip is a single-frame jump (" .. (__SG.multiFrameTrips or 0) .. ")")
-    check(__SG.fastHits == 0, p .. "never hit faster than the swing cooldown (" .. __SG.fastHits .. ")")
-    check(__SG.farHits == 0, p .. "every hit in range of where the server sees you (" .. __SG.farHits .. " too far)")
-    check(__SG.unheldHits == 0, p .. "pickaxe always held (" .. __SG.unheldHits .. ")")
-    check(__SG.taken == 3, p .. "waited out the hatch: all 3 animals grabbed (" .. __SG.taken .. ")")
-    local tookStray = false
-    for _, n in ipairs(__SG.takenNames or {}) do if n == "Stray" then tookStray = true end end
-    check(not tookStray, p .. "grabbed the egg's own animal (HatchId), not the stray")
-    check(__SG.banked == 3, p .. "all 3 banked (" .. __SG.banked .. ")")
-    check(__SG.flungOnPlot == 0, p .. "never hidden while on the plot (" .. __SG.flungOnPlot .. " frames)")
-    check(__SG.bankedWhileFlung == 0, p .. "banking only happens once you're not hidden")
-    check(__SG.carriedUnflungOutside == 0, p .. "hidden the whole way home while carrying (" .. __SG.carriedUnflungOutside .. " frames exposed)")
-    check(not __SG.lastFlung, p .. "stopping the farm stops hiding")
-    check(__SG.autoSwingOn() == false, p .. "Auto Swing still off after farming")
-end
-
-click("Zone: ") -- Any -> 1
-farmRound("Ghost")
-check((__SG.ghostFrames or 0) > 0 and (__SG.maxSpeed or 0) < 1000, "[Ghost] hides by position, not speed")
-
-click("Method: ") -- Ghost -> Fling
-check(buttonStarting("Method: Fling") ~= nil, "method switched to Fling")
-farmRound("Fling")
-check((__SG.maxSpeed or 0) >= 1e6, ("[Fling] Max fling power by default (%.0f)"):format(__SG.maxSpeed or 0))
-check((__SG.ghostFrames or 0) == 0, "[Fling] hides by speed, not position")
-check(buttonStarting("Fling power: Max") ~= nil, "power button shows Max")
-
-__SG.expectWalkOut = false
--- zone 2 egg isn't touched when zone 1 is selected
-__SG.spawnEgg(2, "Swamp Egg", Vector3.new(-600, 2.5, 0), 3)
-local hits = __SG.hits
-click("Auto farm")
-__runFrames(60 * 5)
-check(__SG.hits == hits, "zone filter: zone 2 egg ignored while zone 1 is picked")
-click("Stop everything")
-__runFrames(10)
-
--- restore settings: zone back to Any
-click("Restore settings")
+-- Restore settings: warmup back to 0.15 s
+clickIn("Main", "Restore settings")
 __runFrames(5)
-check(buttonStarting("Zone: Any") ~= nil, "restore settings resets the zone")
-check(buttonStarting("Method: Ghost") ~= nil, "restore settings resets the method")
+local restored = false
+for _, i in ipairs(page("Warmup"):GetChildren()) do
+    if i.ClassName == "TextButton" and i.Text == "Current warmup: 0.15 s" then restored = true end
+end
+check(restored, "restore settings resets the warmup")
 
-click("Unload")
+clickIn("Main", "Unload")
 __runFrames(30)
 local gone = true
 for _, i in ipairs(__all()) do if i.Name == "SmurfySimple" and i.Parent then gone = false end end
 check(gone, "unload removes the UI")
-local f = __SG.flungFrames
+local hf = __SG.hiddenFrames
 __runFrames(30)
-check(__SG.flungFrames == f, "nothing runs after unload")
+check(__SG.hiddenFrames == hf, "nothing hidden after unload")
 
 if #__errors > 0 then
     local seen = {}

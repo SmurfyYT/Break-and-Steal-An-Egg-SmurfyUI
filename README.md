@@ -1,41 +1,44 @@
-# Smurfy's Simple UI — Break & Steal an Egg
+# Smurfy's Simple UI — Movement Lab (Break & Steal an Egg)
 
-`SmurfySimple.lua`: a small script for Delta (Android / BlueStacks). Paste the whole file into the executor.
+`SmurfySimple.lua`: movement / teleport tests for Delta (Android / BlueStacks).
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/SmurfyYT/Break-and-Steal-An-Egg-SmurfyUI/claude/funny-meitner-mtnvz3/SmurfySimple.lua"))()
+```
 
 ## Window
-- Drag the top bar (mouse or touch). The position is remembered.
-- **–** hides the window; tap the round **S** button to bring it back (the S is draggable too).
-- **X** / **Unload** stops everything and removes the UI.
-- **Restore settings** stops the farm and the fling, puts every option back to default and resets the window position.
+- Drag the top bar (touch or mouse). **–** hides it; tap the round **S** to bring it back.
+- Tabs scroll sideways. **Main** has **Restore settings** and **Unload** (also the **X**).
 
-## Test tab
-- **Auto farm**, one round:
-  1. Hidden TP next to an egg and wait 1 second.
-  2. Unhide, walk out of dig reach, walk back (**Walk out & back before mining**, on by default).
-  3. Mine the egg (the server sees you; the game's Auto Swing is kept off).
-  4. Wait for the hatch animation (up to 20 s) until the egg's own animal spawns, then hidden TP to it and grab it.
-  5. Hidden all the way home, unhide just *outside* your plot, walk in so the game banks it.
-- **Method**: **Ghost** (default) or **Fling**.
-- **Zone**: Any (nearest egg) or 1-9.
-- **Fling power** (Fling only): High → Max, default Max.
-- **Bank after every grab** (off = fill the satchel first), **Walk in to bank**.
-- Manual tests: **Hide in place**, **TP → nearest egg**, **TP → outside my plot** (with the picked method).
+## Tests (one per tab)
+Stand somewhere open, press the green button, send the results. A result is **ok** when you
+stay where you went for 2 s after arriving, **BACK** when something moves you more than 8 studs
+away (a server pull-back), **DIED** if you die. Each trial goes back to where you started after.
 
-### How hiding works
-Both methods change what replicates right after physics (Heartbeat), then put you back on a
-"hold" point before the next physics step and before drawing (Stepped / RenderStepped), so on
-your screen you stand still:
-- **Ghost**: your CFrame is moved 9e9 studs away, so the server and other players see you far away.
-  The game's own scripts keep reading your real spot (`hookmetamethod`, when the executor has it).
-- **Fling**: your velocity is set huge, so you look flung out of the map.
+| Tab | What it does |
+|---|---|
+| **Snap** | Live watcher: lists every time you're moved > 8 studs in one frame by something other than the script. Plus a quick check (plain TP 50 studs). |
+| **Ladder** | Plain teleport (no hiding) at 10, 25, 50, 100, 250, 500, 1000 studs. |
+| **Methods** | Plain / Ghost / Fling / 300 studs/s glide at 50, 250, 1000 studs, as a table. |
+| **Warmup** | Hidden time before the jump: none, 1 frame, 0.05, 0.15, 0.5 s (2 tries each). The shortest that always works becomes the warmup used by Ghost / Fling TPs. |
+| **Glide** | Slide there at 100, 300, 1000, 3000, 10000 studs/s; shows the fastest that's accepted. |
+| **Endure** | Stay hidden 5, 15, 30, 60 s, then check you're alive and not pulled. |
+| **Under** | Drop under the floor (20 / 50 / 100 studs), glide under the map with no collisions, come up at the target. Stays 50 studs above the game's kill height. |
 
-A TP = hidden in place for 0.15 s, then the hold point jumps to the target in one frame, so it looks
-like a teleport. You're never hidden on your own plot (you walk off it first). Hitting eggs, grabbing
-and banking need the server to see you there, so the ghost is turned off for those.
+### Hiding methods
+Both change what replicates right after physics (Heartbeat), then put you back on a "hold" point
+before the next physics step and before drawing, so you stand still on screen:
+- **Ghost**: your CFrame is moved 9e9 studs away (the game's own scripts read your real spot via
+  `hookmetamethod`, when the executor has it).
+- **Fling**: your velocity is set huge (Max power).
 
-## Tests
+A hidden TP = hidden in place for the warmup, then the jump in one frame. Hidden tests walk off
+your own plot first.
+
+## Tests of the script
 ```bash
-./tests/run.sh      # needs the luau CLI; LUAU=/path/to/luau to point at it, VERBOSE=1 for the log
+./tests/run.sh      # needs the luau CLI; LUAU=/path/to/luau, VERBOSE=1 for the log
 ```
-Runs the script in a fake Roblox + fake game (rules copied from the place's client scripts) as a phone
-and as a PC. It isn't the real game: the server's anti-cheat and guard behaviour can't be tested here.
+Runs every tab against a fake server with known rules (plain moves over 20 studs a frame get
+pulled back, a jump needs 2 hidden frames before it, 40 s hidden kills you) and checks each test
+finds them. It isn't the real game: the real numbers come from running the tabs in-game.
