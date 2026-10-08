@@ -5,7 +5,9 @@
     Main    : restore settings, unload.
     Snap    : live snap-back watcher (did the server drag you back?) + a quick check.
     Ladder  : plain teleports at growing distances: where does the server pull you back?
-    Methods : Plain / Ghost / Fling / Glide / Velocity / VForce / PlatStand at 50, 250, 1000 studs.
+    VPin    : velocity to a pinned target (walk there, press Set, then launch).
+    VLdr    : velocity at 10→1000 studs — where does the server pull you back?
+    VSpd    : velocity at 100→10000 studs/s — fastest speed the server accepts.
     Warmup  : how long you must be hidden before the jump (0, 1 frame, 0.05, 0.15, 0.5 s).
     Glide   : fastest glide speed the server accepts.
     Endure  : how long you can stay hidden (5, 15, 30, 60 s) before something happens.
@@ -59,6 +61,8 @@ local Defaults = {
     PinY = false,
     PinZ = false,
     PinSpeed = 500,
+    VLdrSpeed = 300,
+    VSpdDist = 250,
 }
 local FlingPowers = { { "High", 5e3 }, { "Very high", 5e4 }, { "Out of the universe", 5e5 }, { "Max", 1e6 } }
 local Settings = table.clone(Defaults)
@@ -914,7 +918,9 @@ end
 local mainPage = makePage("Main")
 local snapPage = makePage("Snap")
 local ladderPage = makePage("Ladder")
-local methodsPage = makePage("Methods")
+local vpinPage = makePage("VPin")
+local vldrPage = makePage("VLdr")
+local vspdPage = makePage("VSpd")
 local warmupPage = makePage("Warmup")
 local glidePage = makePage("Glide")
 local endurePage = makePage("Endure")
@@ -971,48 +977,11 @@ runStop(ladderPage, "Run ladder", ladderOut, function(token, out)
     out(table.concat(lines, "\n") .. "\nDone.")
 end)
 
----------------- Methods
-label(methodsPage, "<b>Method showdown</b>: 7 movement methods at 50, 250 and 1000 studs. Plain/Ghost/Fling/Glide + Velocity (raw physics), VForce (VectorForce impulse), PlatStand (PlatformStand+CFrame). Takes about 2 minutes.")
-local methodsOut = resultsBox(methodsPage)
-local METHODS = {
-    { "Plain",     "Pln" },
-    { "Ghost",     "Gst" },
-    { "Fling",     "Flg" },
-    { "Glide",     "Gld" },
-    { "Velocity",  "Vel" },
-    { "VForce",    "VFc" },
-    { "PlatStand", "Plt" },
-}
-runStop(methodsPage, "Run showdown", methodsOut, function(token, out)
-    local grid = {}
-    local function render(extra)
-        local header = "studs"
-        for _, m in ipairs(METHODS) do header ..= " " .. m[2] end
-        local rows = { header }
-        for _, d in ipairs({ 50, 250, 1000 }) do
-            local row = ("%5d"):format(d)
-            for _, m in ipairs(METHODS) do
-                local r = grid[d .. m[1]]
-                row ..= " " .. (r == nil and " .  " or ("%-4s"):format(short(r)))
-            end
-            table.insert(rows, row)
-        end
-        out(table.concat(rows, "\n") .. (extra and ("\n" .. extra) or ""))
-    end
-    for _, d in ipairs({ 50, 250, 1000 }) do
-        for _, m in ipairs(METHODS) do
-            if not labRunning(token) then return end
-            render(("testing %s %d..."):format(m[1], d))
-            grid[d .. m[1]] = trial(m[1], d, token, { speed = 300 })
-        end
-    end
-    render("ok = stayed, BACK = pulled back, -- = no ground\nDone.")
-end)
-
----------------- Methods: pinned target
+---------------- VPin
+label(vpinPage, "<b>Velocity to pin</b>: walk to your target, press Set, then launch there via raw AssemblyLinearVelocity from anywhere.")
 do
-    local pinOut = resultsBox(methodsPage)
-    local pinLabel -- forward ref so the cycle can refresh
+    local pinOut = resultsBox(vpinPage)
+    local pinLabel
 
     local function pinDesc()
         if Settings.PinX then
@@ -1021,27 +990,27 @@ do
         return "Pin: not set — stand at your target and press Set"
     end
 
-    pinLabel = cycle(methodsPage, pinDesc, function() end)  -- display only
+    pinLabel = cycle(vpinPage, pinDesc, function() end)
 
-    button(methodsPage, "Set pin here", Theme.Item, function()
+    button(vpinPage, "Set pin here", Theme.Item, function()
         local root = getRoot()
         if not root then pinOut("No character.") return end
         local p = root.Position
         Settings.PinX, Settings.PinY, Settings.PinZ = p.X, p.Y, p.Z
         saveSettings()
-        pinLabel()  -- refresh the cycle label
+        pinLabel()
         pinOut("Pinned at " .. ("%0.1f, %0.1f, %0.1f"):format(p.X, p.Y, p.Z))
     end)
 
-    pickCycle(methodsPage, "Speed: ", "PinSpeed", { 200, 500, 1000, 2000 }, function(v) return v .. " studs/s" end)
+    pickCycle(vpinPage, "Speed: ", "PinSpeed", { 200, 500, 1000, 2000 }, function(v) return v .. " studs/s" end)
 
-    runStop(methodsPage, "Velocity to pin", pinOut, function(token, out)
+    runStop(vpinPage, "Velocity to pin", pinOut, function(token, out)
         if not Settings.PinX then out("No pin set. Stand at your target and press Set pin here.") return end
         local target = CFrame.new(Settings.PinX, Settings.PinY, Settings.PinZ)
         local root = getRoot()
         if not root then out("No character.") return end
         local dist = (root.Position - target.Position).Magnitude
-        out(("Going %.0f studs to pin via Velocity..."):format(dist))
+        out(("Going %.0f studs to pin..."):format(dist))
         markOwn(dist / Settings.PinSpeed + 1)
         local dir = (target.Position - root.Position)
         if dir.Magnitude < 0.1 then out("Already there.") return end
@@ -1061,6 +1030,38 @@ do
         out(("Velocity to pin %.0f studs: %s"):format(dist, describe(r)))
     end)
 end
+
+---------------- VLdr
+label(vldrPage, "<b>Velocity ladder</b>: raw AssemblyLinearVelocity at 10, 25, 50, 100, 250, 500, 1000 studs. Shows where the server starts pulling you back.")
+pickCycle(vldrPage, "Speed: ", "VLdrSpeed", { 300, 1000, 3000 }, function(v) return v .. " studs/s" end)
+local vldrOut = resultsBox(vldrPage)
+runStop(vldrPage, "Run ladder", vldrOut, function(token, out)
+    local lines = {}
+    for _, d in ipairs({ 10, 25, 50, 100, 250, 500, 1000 }) do
+        if not labRunning(token) then return end
+        out(table.concat(lines, "\n") .. ("\n%5d studs: testing..."):format(d))
+        local r = trial("Velocity", d, token, { speed = Settings.VLdrSpeed })
+        table.insert(lines, ("%5d studs: %s"):format(d, describe(r)))
+    end
+    out(table.concat(lines, "\n") .. "\nDone.")
+end)
+
+---------------- VSpd
+label(vspdPage, "<b>Velocity speed finder</b>: same distance, increasing velocity — 100, 300, 1000, 3000, 10000 studs/s. Finds the fastest the server accepts.")
+pickCycle(vspdPage, "Distance: ", "VSpdDist", { 100, 250, 500 }, function(v) return v .. " studs" end)
+local vspdOut = resultsBox(vspdPage)
+runStop(vspdPage, "Run speed test", vspdOut, function(token, out)
+    local lines, fastest = {}, nil
+    for _, speed in ipairs({ 100, 300, 1000, 3000, 10000 }) do
+        if not labRunning(token) then return end
+        out(table.concat(lines, "\n") .. ("\n%6d/s: testing..."):format(speed))
+        local r = trial("Velocity", Settings.VSpdDist, token, { speed = speed })
+        table.insert(lines, ("%6d/s: %s"):format(speed, describe(r)))
+        if r.ok then fastest = speed end
+    end
+    table.insert(lines, fastest and ("Fastest ok: " .. fastest .. " studs/s") or "No speed worked.")
+    out(table.concat(lines, "\n") .. "\nDone.")
+end)
 
 ---------------- Warmup
 label(warmupPage, "<b>Warmup tuner</b>: how long you're hidden before the jump. Tries none, 1 frame, 0.05, 0.15 and 0.5 s (2 tries each) and keeps the shortest that always worked.")
