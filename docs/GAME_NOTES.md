@@ -1,110 +1,112 @@
-# Steal An Egg — what we know about the game
+# Steal An Egg — how the game works
 
-From the saved place `Place_107778070777162_Steal_An_Egg_08-10-2026` (place id
-`107778070777162`, compare it as text). **The save's scripts couldn't be
-decompiled** (1983 of 2024 say "decompilation panicked"), so everything here
-comes from the instance tree, attributes, prompt texts and remote names
-(`tools/rbxl_tree.py`, `tools/rbxl_attrs.py`). Things marked ❓ are guesses
-that still need checking in the real game: use **Settings → 🧪 Debug → Copy
-debug report** in game to check them.
+From the decompiled client scripts of `stealnegg.rbxl` (second save; the first
+one's scripts failed to decompile). Script paths below are under
+`ReplicatedStorage`. Read the place with `tools/rbxl_tree.py` and
+`tools/rbxl_attrs.py`.
 
-## Map layout
+## Map
 
 Everything sits on one line along **X** (Z ≈ -365, floor Y ≈ 68):
 
-| Part | Position | Notes |
+- `World.Areas.SeparationLine` (x ≈ 552): its LookVector points into the areas.
+  Past it you're "in gameplay" (`Shared.Util.GuardAreaGeometry.IsPastLine`).
+- Plots are west of the line (`EggCarryBounds.SafeZone`, x 362–552).
+- 13 guarded areas east of it, harder the further east.
+
+| Area | Speed needed | Bounds center X |
 |---|---|---|
-| `World.Areas.EggCarryBounds.SafeZone` | x 362–552 | Where the plots are. |
-| `World.Areas.SeparationLine` | x ≈ 552 | Between the plots and the areas. |
-| Guarded areas | x 553 → 7070 | 13 areas, east of the plots, harder the further east. |
+| Forest | 11 | 600 |
+| Lake | 900 | 722 |
+| Desert | 10K | 901 |
+| Jungle | 40K | 1125 |
+| Snow | 170K | 1405 |
+| Volcano | 700K | 1759 |
+| Abyss Ocean | 2.5M | 2166 |
+| Prehistoric | 18M | 2634 |
+| Cosmic | 700M | 3207 |
+| Cherry Blossom | 2.5B | 3928 |
+| Titan Temple | 7B | 4698 |
+| Light Dark | 20B | 5577 |
+| Enchanted Forest | 50B | 6524 |
 
-`EggCarryBounds` has the attribute *"Playable floor footprints for carried-egg
-cancellation. Upper height is ignored."*: a carried egg is cancelled when you
-leave those floors (so flying high is fine, leaving the map sideways isn't).
+Area model: `Bounds`, `ClosestExitPoint`, `Nests`, `Guard` (attributes
+`GuardState` = "Sleeping" / "Waking" / "Chasing", `TargetPlayer` = player
+name or "", `WakeTargetPlayer`), area attribute `GuardEscapeSpeeds`
+(Vector2, X = Speed needed). Without enough Speed the server sends
+`GuardPatrol.SpeedTollWarning` ("You don't have enough speed!").
 
-## Plots — `workspace.Plots.<1..7>`
+## Field eggs (the ones you steal) — `Client.EggState`
 
-- Owner: `PlotSign.PlayerPlotSign.Frame.PlayerName.Text` = the owner's **user
-  name** (no Owner value or attribute).
-- Parts: `SpawnPoint` (home spot, used by auto steal), `CenterPoint`,
-  `TreadmillBottom`, `ToUpdate.PetArea` (50×49 pen floor),
-  `ToUpdate.StarterPen.Prompt1..3` (parts; prompts are made at runtime ❓).
-- Attribute `BaseUpgradeLevel`.
+The module keeps every field egg as a record (`Shared.Types.AreaEggs`):
 
-## Areas — `workspace.World.Areas.GuardAreas.<Area>`
+```
+Uid, AreaId, NestId, AssetCategory (the pet), AssetScale, Mutations,
+BottomCFrame, BoundsCFrame (where it is), BoundsSize,
+State = "Slot" | "Carried" | "Dropped" | "GuardCarried" | "Claimed",
+CarrierUserId?, DroppedAt?, Version
+```
 
-Each area model has `Bounds` (floor part), `ClosestExitPoint`, `Nests`,
-`RequiredSpeedSign`, and a `Guard` model with attributes `AreaId`,
-`GuardState` ("Sleeping"…), `Sleeping`, `TargetPlayer` (name ❓),
-`WakeTargetPlayer`. The area's `GuardEscapeSpeeds` (Vector2): **X = Speed
-needed** (the Rift Machine says "Unlocked at 700M speed", Cosmic needs 700M),
-Y = maybe the guard's run speed ❓.
+- `EggState.ReadFieldEggs()` → `{ Records, ServerTime }` (kept live by the
+  `RE.EggWorld.FieldEgg*` events). Fallback: `RF.EggWorld.AskFieldEggSnapshot`.
+- **Steal**: `EggState.CarryFieldEgg(uid, slotKey)` =
+  `RF.EggWorld.AskFieldEggCarry:InvokeServer({ Uid, FirstAreaSlotKey })` →
+  `ok, reason`. `slotKey` = `"<AreaId>:<NestId>"` only for uids starting with
+  `FirstAreaEgg_` (the tutorial egg), else nil.
+- The game's prompt (`Controllers.Game.AreaEggsController`): `CarryAreaEgg`,
+  MaxActivationDistance 8, hold 1.2 s (0.25 s with the workspace attribute
+  `FastEggPickupTime`), enabled only past the SeparationLine and when the
+  character isn't `IsTrapped`.
+- `RE.EggWorld.FieldEggCarry` → `{ IsCarrying, Uid?, AreaId?, AssetCategory?,
+  RunBackWakeDelayRequired?, GuardDisabled?, SpeedMultiplier }`.
+- Delivery: back at your plot's spawn (the tutorial's "Go to your Pen!" points
+  at the plot spawn). The server then sends `RE.EggWorld.FieldEggRedeemVerdict`
+  → `{ AssetCategory, DisplayName, Rarity, Color, Position }` ("You stole an
+  EGG!"). Decided server-side; the exact radius isn't in the client.
+- Drop: `RF.EggWorld.AskFieldEggDrop({ Reason })`.
 
-| Area | Speed needed | Bounds center X | Width |
-|---|---|---|---|
-| Forest | 11 | 600 | 93 |
-| Lake | 900 | 722 | 140 |
-| Desert | 10K | 901 | 205 |
-| Jungle | 40K | 1125 | 230 |
-| Snow | 170K | 1405 | 318 |
-| Volcano | 700K | 1759 | 379 |
-| Abyss Ocean | 2.5M | 2166 | 423 |
-| Prehistoric | 18M | 2634 | 502 |
-| Cosmic | 700M | 3207 | 642 |
-| Cherry Blossom | 2.5B | 3928 | 676 |
-| Titan Temple | 7B | 4698 | 860 |
-| Light Dark | 20B | 5577 | 894 |
-| Enchanted Forest | 50B | 6524 | 1090 |
+## Your eggs — place and hatch
 
-## Eggs in the areas
+- A stolen egg becomes a **Tool**: attributes `ItemType = "AssetEgg"`, `UID`.
+- **Place** (`Controllers.Game.Eggs.EggPlacementController`): with the tool
+  held, `EggState.PlantEgg(uid, CenterPoint.CFrame:ToObjectSpace(CFrame.new(hit)))`
+  = `RF.EggWorld.AskPlaceEgg({ Uid, LocalCFrame })`, where `hit` is a point on
+  the plot's `ToUpdate.PetArea` and `CenterPoint` is the plot's own.
+- `EggState.ReadOwnerEggs(userId)` → `{ [uid] = record }`; placed ones have
+  `Placement = { LocalCFrame, PlacedAt, GrowthDuration?, ReadyAt?, ... }`.
+- **Hatch** (`Shared.Eggs.PlacedEggRenderer`): when `EggState.IsReadyToHatch(uid)`,
+  `EggState.BeginHatch(uid)` (`RF.EggWorld.AskHatch`), the animation plays,
+  then `EggState.FinishHatch(uid)` (`RF.EggWorld.AskFinishHatch`) → granted pet uid.
+  Not ready yet → the prompt offers "Skip Growth" (Robux) instead.
 
-- Models in `workspace.AreaEggSlotsClient` (GUID names, drawn by the client),
-  each with a `Hitbox` part. Some have `PreparedSourceName =
-  "Workspace.NewEggs.<Name>"` (used as the egg's name), rare ones have a
-  `RareAreaEggHighlight` child.
-- The steal button: a `ProximityPrompt` named **`CarryAreaEgg`** (ActionText
-  "Steal", ObjectText "Egg") on a part named `SmartPromptPart` straight in
-  `workspace`, sitting on the egg. Matched to the egg model by position.
-- A few `SmartPromptPart`s carry a prompt "Apply Mutation" instead.
+## Pets, rarities
 
-## Stats
+- `Data.Assets.Directory[AssetCategory]` → `{ DisplayName, Rarity, EarningRate, Egg = { GrowthTime, ... } }`.
+- `Data.Rarity` ranks: Common 1, Uncommon / SuperRare 2, Rare 3, Epic 4,
+  Legendary 5, Mythic / Rainbow / BrainrotGod 6, Cosmic 7, Secret 8,
+  Eternal / Limited 9, Divine / Transcendent 10, Titan 11, LightDark 12.
 
-`leaderstats.Speed` and `leaderstats["Money/s"]` (NumberValues). Player
-attributes include `ActiveTrapCount`, `RagdollEndTime`, cash pack amounts.
+## Plots — `workspace.Plots.<n>`
 
-## Shops and machines
+`Client.PlotState.ResolvePlot()` → `{ PlotFolder, PetArea, CenterPoint, ... }`
+for your plot (ownership comes from the server, the sign just shows it).
+Parts: `SpawnPoint`, `CenterPoint`, `TreadmillBottom`, `ToUpdate.PetArea`.
 
-| Thing | Path |
+## Other remotes (arguments from the game's calls)
+
+| What | Call |
 |---|---|
-| Sell all / sell held | `Stands.Prompts.SellAll` / `SellHeldAsset` (prompts) |
-| Gear shop | `Stands.Models.GearShopStand` |
-| Trail shop | `Stands.Pads.TrailShop` |
-| Group reward | `World.GroupReward` (prompt "CLAIM!") |
-| Fuse / Rift / Butterfly | `World.Machines.FuseMachine` / `RiftMachine` / `ButterflyStation` |
-| Enchanted Tree | `World.Build.EnchantedTreeInterior.Markers.EnterTrigger` |
+| Away earnings | `RF.AwayEarnings.AskCollect({ Kind = "Claim" })` → ok, _, `{ AwardedAmount }` |
+| Equip best pets | `RF.Haul.WearBest()` |
+| Treadmill | standing on your treadmill: the client calls `RF.Treadmill.AskWearStill()` and the server trains Speed (`RE.Treadmill.SpeedGained`) |
+| Treadmill upgrade | `RF.Treadmill.AskTierRaise(id)` |
+| Base upgrade | `RE.Homestead.AskBaseTierRaise:FireServer()` |
+| Index rewards | `RF.Codex.AskRedeemAll()` |
+| Group reward | `RF.GroupPerk.RedeemPerk(id)` |
+| Sell all (NPC) | `RE.PetSatchel.SellEveryPet:FireServer(list)` |
 
-## Remotes — `ReplicatedStorage.Packages.Networking.<RE|RF>.<Group>.<Name>`
+## Anti-cheat seen in the client
 
-Folders (not the `RE/Name` single-instance style of the other game). The
-interesting ones (arguments unknown ❓):
-
-- `RE.EggWorld`: `FieldEggCarry`, `FieldEggGone`, `FieldEggRedeemVerdict`,
-  `FieldEggShifted`, `FieldEggBatchShifted`, `FieldEggCycleCountdown`,
-  `OwnerDropped`, `OwnerShifted`
-- `RF.EggWorld`: `AskFieldEggCarry`, `AskFieldEggDrop`, `AskPlaceEgg`,
-  `AskHatch`, `AskFinishHatch`, `AskSkipGrowth`, `AskWearTool`, `AskDoffTool`
-- `RE.GuardPatrol`: `Rouse`, `ForestStrike`, `SpeedTollWarning`, `SpeedTollOffer`
-- `RF.AwayEarnings`: `AskCollect`, `FetchSummary` — `RF.Haul`: `WriteAutoSell`, `WearBest`
-- `RE.PetSatchel`: `SellPet`, `SellEveryPet` — `RE.Treadmill.SpeedGained`
-
-The script only **listens** to the `RE` ones (counting steals / deliveries and
-logging them for the debug report). It doesn't call any `RF` yet: their
-arguments need to be seen first (turn on event printing and copy the report).
-
-## Open questions (check in game)
-
-1. Does a teleported egg count at home, or does it need walking/flying in?
-2. What does `FieldEggCarry` send (who carries, which egg)?
-3. Where exactly does an egg count as delivered (safe zone, plot, pen)?
-4. How are eggs placed and hatched (prompts in the pen, or a GUI)?
-5. Does the server check speed / teleports (the `SpeedToll` remotes)?
+- `ObbyAntiTPClientController` only covers the monster event's obby region.
+- Nothing client-side checks teleports on the main map; the server decides
+  carries and deliveries (unknown checks). Fly home is there as the safer option.

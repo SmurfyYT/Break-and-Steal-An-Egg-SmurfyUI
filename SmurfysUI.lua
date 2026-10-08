@@ -1,9 +1,12 @@
 --[[
-    Smurfy's UI  v1.0  -  Steal An Egg
+    Smurfy's UI  v1.1  -  Steal An Egg
     ------------------------------------------------------------
-    - Auto steal: teleports to eggs in the guarded areas, steals them and
-      brings them home. Pick areas, rare eggs only, teleport or fly home.
-    - ESP for eggs, guards and players, area teleports, guard alerts.
+    - Auto steal: teleports to eggs in the guarded areas, steals them with
+      the game's own request and brings them home. Rarest first; filter by
+      lowest rarity, area and your Speed; teleport or fly home; trains on
+      your treadmill while no eggs are out.
+    - Base: auto place eggs, auto hatch, collect away earnings, equip best.
+    - ESP for eggs (pet + rarity), guards and players, area teleports.
     - Works on PC, tablet and phone. The device is detected on load
       (Settings > Device can force a layout).
     - PC: drag the window by the top bar, keybinds in Settings,
@@ -19,7 +22,7 @@
 -- ========================= CONFIG =========================
 local CONFIG = {
     Title       = "Smurfy's",
-    Version     = "v1.0",
+    Version     = "v1.1",
     DiscordLink = "https://discord.gg/5KFN8bbXhW",
     MenuKey     = Enum.KeyCode.RightShift,
     FlyKey      = Enum.KeyCode.Q,
@@ -1673,20 +1676,27 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
 end))
 
 -- ========================= STEAL AN EGG: THE GAME =========================
--- How the game is put together. Its scripts couldn't be decompiled from the
--- saved place, so this comes from the instance tree, attributes and remotes
--- (see docs/GAME_NOTES.md):
---   * Plots: workspace.Plots.<1-7>. The owner's name is on the plot sign
---     (PlotSign.PlayerPlotSign.Frame.PlayerName). Each has a SpawnPoint,
---     CenterPoint and TreadmillBottom part.
---   * Areas: workspace.World.Areas.GuardAreas.<Area>, lined up east of the
---     plots. Each has a Bounds part (the floor), a ClosestExitPoint, a Guard
---     model (attributes GuardState, Sleeping, TargetPlayer) and the attribute
+-- How the game works (from its client scripts, see docs/GAME_NOTES.md):
+--   * The game keeps every egg lying in the areas as a record in its
+--     ReplicatedStorage.Client.EggState module: Uid, AreaId, NestId,
+--     AssetCategory (the pet inside), BoundsCFrame (where it is) and State
+--     ("Slot" / "Dropped" can be stolen, "Carried" / "Claimed" can't).
+--   * Stealing = EggState.CarryFieldEgg(uid, slotKey), which is
+--     RF.EggWorld.AskFieldEggCarry({ Uid, FirstAreaSlotKey }). The game's own
+--     prompt only allows it past the SeparationLine, within 8 studs.
+--   * The server tells the carrier RE.EggWorld.FieldEggCarry({ IsCarrying, ... })
+--     and, once you're back at your plot's spawn ("Go to your Pen!"),
+--     RE.EggWorld.FieldEggRedeemVerdict({ DisplayName, Rarity, Color, ... }).
+--   * Stolen eggs become Tools (attribute ItemType = "AssetEgg", UID). Placing
+--     one = EggState.PlantEgg(uid, CenterPoint:ToObjectSpace(spot on PetArea)),
+--     hatching = EggState.BeginHatch(uid) then EggState.FinishHatch(uid).
+--   * Plots: workspace.Plots.<n> (CenterPoint, SpawnPoint, ToUpdate.PetArea,
+--     TreadmillBottom); the game's PlotState module knows which one is yours.
+--   * Areas: workspace.World.Areas.GuardAreas.<Area> with Bounds, Guard
+--     (GuardState "Sleeping" / "Waking" / "Chasing", TargetPlayer = name) and
 --     GuardEscapeSpeeds (Vector2, X = the Speed you need there).
---   * Eggs lying in the areas are models in workspace.AreaEggSlotsClient. The
---     "Steal" button is a ProximityPrompt called CarryAreaEgg on a
---     workspace.SmartPromptPart that sits on the egg.
---   * Remotes: ReplicatedStorage.Packages.Networking.<RE|RF>.<Group>.<Name>
+-- Game code is only ever called from the script's own background threads
+-- (never from a thread that touches the menu).
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local function findPath(root, path)
@@ -1697,11 +1707,35 @@ local function findPath(root, path)
     return node
 end
 
-local World = { Plot = nil }
+local World = {
+    Plot = nil,
+    Mods = {},          -- the game's modules, once loaded (EggState, PlotState, Assets)
+    Field = nil,        -- latest field egg records (plain copies), nil until read
+    FieldAt = 0,
+    Owned = {},         -- your eggs: [uid] = record
+    AssetCache = {},    -- [AssetCategory] = { Name, Rarity, Rank, Color }
+}
 
--- a remote of the game's Networking package, e.g. World.Remote("RE", "EggWorld", "FieldEggCarry")
+-- a remote of the game's Networking package, e.g. World.Remote("RF", "EggWorld", "AskFieldEggCarry")
 function World.Remote(kind, group, name)
     return findPath(ReplicatedStorage, { "Packages", "Networking", kind, group, name })
+end
+
+-- calls an RF remote, returns ok (the server's first answer == true) and its answers
+function World.Invoke(group, name, ...)
+    local remote = World.Remote("RF", group, name)
+    if not (remote and remote:IsA("RemoteFunction")) then return false, "no remote " .. group .. "." .. name end
+    local args = table.pack(...)
+    local results = table.pack(pcall(function() return remote:InvokeServer(table.unpack(args, 1, args.n)) end))
+    if not results[1] then return false, tostring(results[2]) end
+    return results[2] == true, results[3], results[4]
+end
+
+local function requireModule(path)
+    local module = findPath(ReplicatedStorage, path)
+    if not (module and module:IsA("ModuleScript")) then return nil end
+    local ok, result = pcall(require, module)
+    return ok and type(result) == "table" and result or nil
 end
 
 function World.PlotOwner(plot)
@@ -1710,16 +1744,17 @@ function World.PlotOwner(plot)
     return ok and type(text) == "string" and text or nil
 end
 
+-- your plot: the game's PlotState (set in the background thread), else the sign
 function World.MyPlot()
     local cached = World.Plot
-    if cached and cached.Parent and World.PlotOwner(cached) == LocalPlayer.Name then return cached end
+    if cached and cached.Parent then return cached end
     World.Plot = nil
     local plots = workspace:FindFirstChild("Plots")
     if not plots then return nil end
     local byDisplay
     for _, plot in ipairs(plots:GetChildren()) do
         local owner = World.PlotOwner(plot)
-        if owner == LocalPlayer.Name or plot:GetAttribute("OwnerUserId") == LocalPlayer.UserId then
+        if owner == LocalPlayer.Name then
             World.Plot = plot
             return plot
         end
@@ -1731,10 +1766,11 @@ end
 function World.PlotPart(name)
     local plot = World.MyPlot()
     local part = plot and plot:FindFirstChild(name)
+    if not part and name == "PetArea" then part = plot and findPath(plot, { "ToUpdate", "PetArea" }) end
     return part and part:IsA("BasePart") and part or nil
 end
 
--- where you stand at home: the plot's spawn point (inside the safe zone)
+-- where you stand at home: the plot's spawn point (the game's "Go to your Pen!")
 function World.HomeCFrame()
     local part = World.PlotPart("SpawnPoint") or World.PlotPart("CenterPoint")
     return part and CFrame.new(part.Position + Vector3.new(0, 3.5, 0)) or nil
@@ -1747,12 +1783,10 @@ function World.IsHome()
     return ((root.Position - home.Position) * Vector3.new(1, 0, 1)).Magnitude < 25
 end
 
--- your Speed stat (the leaderboard's Speed column)
-function World.Speed()
-    local stats = LocalPlayer:FindFirstChild("leaderstats")
-    local v = stats and stats:FindFirstChild("Speed")
-    local ok, n = pcall(function() return v and tonumber(v.Value) end)
-    return ok and n or nil
+-- your plot's treadmill: stand on it and the game trains your Speed
+function World.TreadmillCFrame()
+    local belt = World.PlotPart("TreadmillBottom")
+    return belt and CFrame.new(belt.Position + Vector3.new(0, 3, 0)) or nil
 end
 
 function World.Stat(name)
@@ -1761,6 +1795,9 @@ function World.Stat(name)
     local ok, n = pcall(function() return v and tonumber(v.Value) end)
     return ok and n or nil
 end
+
+-- your Speed stat (the leaderboard's Speed column)
+function World.Speed() return World.Stat("Speed") end
 
 -- 1.2K, 3.4M, 5B...
 function World.Short(n)
@@ -1774,7 +1811,14 @@ function World.Short(n)
     return tostring(math.floor(n))
 end
 
--- every area, easiest first: { Name, Model, Bounds, Exit, Guard, Need }
+-- rarity tiers, lowest first (the game's Data.Rarity ranks)
+World.Rarities = {
+    { "Common", 1 }, { "Uncommon", 2 }, { "Rare", 3 }, { "Epic", 4 }, { "Legendary", 5 },
+    { "Mythic", 6 }, { "Cosmic", 7 }, { "Secret", 8 }, { "Eternal", 9 }, { "Divine", 10 },
+    { "Titan", 11 }, { "LightDark", 12 },
+}
+
+-- every area, easiest first: { Name, Model, Bounds, Exit, Guard, Need, Rank }
 function World.Areas()
     local folder = findPath(workspace, { "World", "Areas", "GuardAreas" })
     local list = {}
@@ -1826,62 +1870,52 @@ local function partPosition(inst)
     return ok and pivot.Position or nil
 end
 
--- the egg model sitting at pos (its name and whether the game marks it rare)
-function World.EggModelAt(pos)
-    local folder = workspace:FindFirstChild("AreaEggSlotsClient")
-    local best, bestDistance
-    for _, model in ipairs(folder and folder:GetChildren() or {}) do
-        local hitbox = model:FindFirstChild("Hitbox")
-        local p = hitbox and hitbox:IsA("BasePart") and hitbox.Position or partPosition(model)
-        if p then
-            local d = ((p - pos) * Vector3.new(1, 0, 1)).Magnitude
-            if d < 8 and (not bestDistance or d < bestDistance) then best, bestDistance = model, d end
-        end
-    end
-    return best
+-- the pet inside an egg: name, rarity and color (from the cache the
+-- background thread fills from the game's Data.Assets)
+function World.AssetInfo(category)
+    return World.AssetCache[category] or { Name = tostring(category or "Egg"), Rarity = "?", Rank = 0 }
 end
 
-function World.EggName(model)
-    local source = model and model:GetAttribute("PreparedSourceName")
-    if type(source) == "string" then
-        local name = string.match(source, "([^%.]+)$")
-        if name and name ~= "" then return name end
-    end
-    return "Egg"
-end
-
--- every egg you can steal right now:
--- { Prompt, Part, Position, Model, Name, Rare, Area }
+-- every egg you can steal right now, from the game's records:
+-- { Uid, Record, Position, Name, Rarity, Rank, Color, Rare, Area, Prompt? }
+-- (falls back to the Steal prompts if the records can't be read)
 function World.EggTargets(areas)
     areas = areas or World.Areas()
+    local byName = {}
+    for _, area in ipairs(areas) do byName[area.Name] = area end
     local list = {}
-    local function add(prompt)
-        if not (prompt:IsA("ProximityPrompt") and prompt.Name == "CarryAreaEgg") then return end
-        local part = prompt.Parent
-        local pos = part and partPosition(part)
-        if not pos then return end
-        local model = World.EggModelAt(pos)
-        table.insert(list, {
-            Prompt = prompt,
-            Part = part,
-            Position = pos,
-            Model = model,
-            Name = World.EggName(model),
-            Rare = model ~= nil and model:FindFirstChild("RareAreaEggHighlight") ~= nil,
-            Area = World.AreaAt(pos, areas),
-        })
-    end
-    -- the prompt parts live straight in workspace (and maybe in the egg models)
-    for _, child in ipairs(workspace:GetChildren()) do
-        if child:IsA("BasePart") then
-            local prompt = child:FindFirstChild("CarryAreaEgg")
-            if prompt then add(prompt) end
+    local records = World.Field
+    if records then
+        for _, r in ipairs(records) do
+            if (r.State == "Slot" or r.State == "Dropped") and typeof(r.BoundsCFrame) == "CFrame" then
+                local info = World.AssetInfo(r.AssetCategory)
+                local pos = r.BoundsCFrame.Position
+                table.insert(list, {
+                    Uid = r.Uid,
+                    Record = r,
+                    Position = pos,
+                    Name = info.Name,
+                    Rarity = info.Rarity,
+                    Rank = info.Rank,
+                    Color = info.Color,
+                    Rare = info.Rank >= 5,
+                    Dropped = r.State == "Dropped",
+                    Area = byName[r.AreaId] or World.AreaAt(pos, areas),
+                })
+            end
         end
+        return list
     end
-    if #list == 0 then
-        local folder = workspace:FindFirstChild("AreaEggSlotsClient")
-        for _, d in ipairs(folder and folder:GetDescendants() or {}) do
-            if d.Name == "CarryAreaEgg" then add(d) end
+    -- fallback: the CarryAreaEgg prompts the game puts on each egg
+    for _, child in ipairs(workspace:GetChildren()) do
+        local prompt = child:IsA("BasePart") and child:FindFirstChild("CarryAreaEgg")
+        if prompt and prompt:IsA("ProximityPrompt") then
+            local pos = child.Position
+            table.insert(list, {
+                Prompt = prompt, Part = child, Position = pos,
+                Name = "Egg", Rarity = "?", Rank = 0, Rare = false,
+                Area = World.AreaAt(pos, areas),
+            })
         end
     end
     return list
@@ -1898,7 +1932,7 @@ function World.CachedTargets()
     return list, areas
 end
 
--- a guard chasing you (its TargetPlayer is your name or user id)
+-- a guard chasing you (its TargetPlayer is your name)
 function World.ChasingGuard(areas)
     for _, area in ipairs(areas or World.Areas()) do
         local guard = area.Guard
@@ -1912,6 +1946,26 @@ function World.ChasingGuard(areas)
     return nil
 end
 
+-- the model the game draws for an egg (named after its uid)
+function World.EggModel(uid)
+    local folder = workspace:FindFirstChild("AreaEggSlotsClient")
+    local model = (folder and folder:FindFirstChild(uid)) or workspace:FindFirstChild(uid)
+    return model and model:IsA("Model") and model or nil
+end
+
+-- your egg tools (stolen eggs waiting to be placed)
+function World.EggTools()
+    local list = {}
+    for _, holder in ipairs({ LocalPlayer:FindFirstChildOfClass("Backpack"), LocalPlayer.Character }) do
+        for _, tool in ipairs(holder and holder:GetChildren() or {}) do
+            if tool:IsA("Tool") and tool:GetAttribute("ItemType") == "AssetEgg" and type(tool:GetAttribute("UID")) == "string" then
+                table.insert(list, tool)
+            end
+        end
+    end
+    return list
+end
+
 local function triggerPrompt(prompt)
     if type(fireproximityprompt) == "function" then
         if pcall(fireproximityprompt, prompt) then return end
@@ -1923,6 +1977,132 @@ local function triggerPrompt(prompt)
     end)
 end
 
+-- ---------- the game's calls (background threads only) ----------
+-- steal: true, or false and the server's reason
+function World.Carry(uid, record)
+    local key
+    if string.find(uid, "FirstAreaEgg_", 1, true) == 1 and record and record.AreaId and record.NestId then
+        key = string.format("%s:%s", record.AreaId, record.NestId) -- the tutorial area's slot key
+    end
+    local EggState = World.Mods.EggState
+    if EggState and EggState.CarryFieldEgg then
+        local ok, okCarry, reason = pcall(EggState.CarryFieldEgg, uid, key)
+        if ok then return okCarry == true, reason end
+    end
+    local ok, reason = World.Invoke("EggWorld", "AskFieldEggCarry", { Uid = uid, FirstAreaSlotKey = key })
+    return ok, reason
+end
+
+function World.Plant(uid, localCFrame)
+    local EggState = World.Mods.EggState
+    if EggState and EggState.PlantEgg then
+        local ok, planted, reason = pcall(EggState.PlantEgg, uid, localCFrame)
+        if ok then return planted == true, reason end
+    end
+    return World.Invoke("EggWorld", "AskPlaceEgg", { Uid = uid, LocalCFrame = localCFrame })
+end
+
+function World.ReadyToHatch(uid, record)
+    local EggState = World.Mods.EggState
+    if EggState and EggState.IsReadyToHatch then
+        local ok, ready = pcall(EggState.IsReadyToHatch, uid)
+        if ok then return ready == true end
+    end
+    local placement = record and record.Placement
+    local readyAt = type(placement) == "table" and tonumber(placement.ReadyAt)
+    return readyAt ~= nil and workspace:GetServerTimeNow() >= readyAt
+end
+
+function World.Hatch(uid)
+    local EggState = World.Mods.EggState
+    local begin = function()
+        if EggState and EggState.BeginHatch then
+            local ok, a, b = pcall(EggState.BeginHatch, uid)
+            if ok then return a == true, b end
+        end
+        return World.Invoke("EggWorld", "AskHatch", uid)
+    end
+    local finish = function()
+        if EggState and EggState.FinishHatch then
+            local ok, a, b = pcall(EggState.FinishHatch, uid)
+            if ok then return a == true, b end
+        end
+        return World.Invoke("EggWorld", "AskFinishHatch", uid)
+    end
+    local ok, reason = begin()
+    if not ok then return false, reason end
+    task.wait(2) -- the game plays its hatch animation before finishing
+    for _ = 1, 3 do
+        local done, why = finish()
+        if done then return true end
+        reason = why
+        task.wait(1.5)
+    end
+    return false, reason
+end
+
+-- background thread: loads the game's modules and keeps plain copies of the
+-- egg records for the menu, ESP and auto steal
+task.spawn(function()
+    local mods = World.Mods
+    mods.EggState = requireModule({ "Client", "EggState" })
+    mods.PlotState = requireModule({ "Client", "PlotState" })
+    mods.Assets = requireModule({ "Data", "Assets" })
+    local fallbackAt = 0
+    while Alive do
+        -- your plot, as the game knows it
+        if mods.PlotState and mods.PlotState.ResolvePlot then
+            local ok, info = pcall(mods.PlotState.ResolvePlot)
+            local folder = ok and type(info) == "table" and info.PlotFolder or nil
+            if typeof(folder) == "Instance" then World.Plot = folder end
+        end
+        -- field eggs
+        local records
+        if mods.EggState and mods.EggState.ReadFieldEggs then
+            local ok, rows = pcall(mods.EggState.ReadFieldEggs)
+            if ok and type(rows) == "table" and type(rows.Records) == "table" then records = rows.Records end
+        end
+        if not records and os.clock() >= fallbackAt then
+            fallbackAt = os.clock() + 3
+            local remote = World.Remote("RF", "EggWorld", "AskFieldEggSnapshot")
+            if remote then
+                local ok, snap = pcall(function() return remote:InvokeServer() end)
+                if ok and type(snap) == "table" and type(snap.Records) == "table" then World.FallbackField = snap.Records end
+            end
+        end
+        records = records or World.FallbackField
+        if records then
+            -- pet names / rarities for the eggs we haven't seen yet
+            local directory = mods.Assets and mods.Assets.Directory
+            for _, r in ipairs(records) do
+                local category = r.AssetCategory
+                if category and not World.AssetCache[category] then
+                    local info = { Name = tostring(category), Rarity = "?", Rank = 0 }
+                    local config = type(directory) == "table" and directory[category]
+                    if type(config) == "table" then
+                        info.Name = tostring(config.DisplayName or category)
+                        local rarity = config.Rarity
+                        if type(rarity) == "table" then
+                            info.Rarity = tostring(rarity.DisplayName or rarity._id or "?")
+                            info.Rank = tonumber(rarity.Rank) or 0
+                            if typeof(rarity.Color) == "Color3" then info.Color = rarity.Color end
+                        end
+                    end
+                    World.AssetCache[category] = info
+                end
+            end
+            World.Field = records
+            World.FieldAt = os.clock()
+        end
+        -- your own eggs (placed / growing)
+        if mods.EggState and mods.EggState.ReadOwnerEggs then
+            local ok, owned = pcall(mods.EggState.ReadOwnerEggs, LocalPlayer.UserId)
+            if ok and type(owned) == "table" then World.Owned = owned end
+        end
+        task.wait(0.4)
+    end
+end)
+
 -- ========================= AUTO STEAL ENGINE =========================
 local Farm = {
     Enabled = false,
@@ -1933,18 +2113,19 @@ local Farm = {
     SessionStolen = 0,     -- since auto steal was last turned on
     SessionStart = nil,
     Available = 0,         -- eggs out that match your filters
-    FlagAlertUntil = 0,    -- the S pill turns red for a bit after a guard catch
+    FlagAlertUntil = 0,    -- the S pill turns red for a bit after a guard chase
     Caught = 0,
     -- filters
     Areas = {},            -- [area name] = false to skip it (the Steal tab's toggles)
-    RareOnly = false,
+    MinRank = 0,           -- lowest rarity rank to steal (0 = any)
     SafeOnly = true,       -- only areas your Speed is high enough for
     -- how to get home with the egg: "Teleport" or "Fly" (straight line at FlySpeed)
     HomeMode = "Teleport",
     FlySpeed = 120,
-    DeliverWait = 1.5,     -- seconds to stand at home so the egg counts
-    Skip = setmetatable({}, { __mode = "k" }),
-    Carrying = false,      -- the game told us we're carrying an egg
+    DeliverWait = 3,       -- seconds to wait at home for the "You stole an EGG!"
+    IdleTreadmill = true,  -- train on your treadmill while no eggs are out
+    Skip = {},             -- [uid] = os.clock() until which it's skipped
+    Carrying = false,      -- the server says you carry an egg
     Events = {},           -- newest first: what the game's egg remotes said
     Last = nil,
 }
@@ -1977,9 +2158,8 @@ track(LocalPlayer.CharacterAdded:Connect(function()
     Farm.Carrying = false
 end))
 
--- listen to the game's egg remotes: when you pick up / lose / bring home an
--- egg the server tells the client. The arguments aren't known yet, so only
--- the event names are used (and logged for the debug report).
+-- the game's egg remotes: carry state and "you stole an egg" (also logged
+-- for the debug report)
 do
     local function describe(...)
         local parts = {}
@@ -1988,8 +2168,8 @@ do
             local t = typeof(v)
             if t == "table" then
                 local keys = {}
-                for k in pairs(v) do
-                    table.insert(keys, tostring(k))
+                for k, val in pairs(v) do
+                    table.insert(keys, tostring(k) .. "=" .. string.sub(tostring(val), 1, 24))
                     if #keys >= 6 then break end
                 end
                 table.insert(parts, "{" .. table.concat(keys, ",") .. "}")
@@ -2011,39 +2191,31 @@ do
             if onEvent then pcall(onEvent, ...) end
         end))
     end
-    listen("EggWorld", "FieldEggCarry", function(...)
-        -- if it names another player it's about them; otherwise count it
-        for i = 1, select("#", ...) do
-            local v = select(i, ...)
-            if typeof(v) == "Instance" and v:IsA("Player") and v ~= LocalPlayer then return end
-        end
-        Farm.Carrying = true
-        Farm.LastCarry = os.clock()
+    listen("EggWorld", "FieldEggCarry", function(state)
+        if type(state) ~= "table" then return end
+        Farm.Carrying = state.IsCarrying == true
+        if Farm.Carrying then Farm.LastCarry = os.clock() end
     end)
-    listen("EggWorld", "FieldEggRedeemVerdict", function() Farm.LastVerdict = os.clock() end)
+    listen("EggWorld", "FieldEggRedeemVerdict", function(info)
+        Farm.LastVerdict = os.clock()
+        if type(info) == "table" and info.DisplayName then
+            Farm.Last = tostring(info.DisplayName) .. (info.Rarity and (" · " .. tostring(info.Rarity)) or "")
+        end
+    end)
     listen("EggWorld", "FieldEggGone")
-    listen("EggWorld", "FieldEggShifted")
-    listen("EggWorld", "OwnerDropped")
-    listen("GuardPatrol", "ForestStrike")
     listen("GuardPatrol", "Rouse")
-    listen("GuardPatrol", "SpeedTollWarning")
-end
-
--- does the egg's prompt still exist (nobody took it)?
-function Farm.TargetGone(target)
-    local prompt, part = target.Prompt, target.Part
-    return not (prompt.Parent and part.Parent)
+    listen("GuardPatrol", "SpeedTollWarning", function() Farm.SpeedWarnedAt = os.clock() end)
 end
 
 function Farm.Allowed(target, speed)
     local area = target.Area
-    if Farm.RareOnly and not target.Rare then return false end
+    if target.Rank < Farm.MinRank then return false end
     if area and Farm.Areas[area.Name] == false then return false end
     if Farm.SafeOnly and area and speed and area.Need > speed then return false end
     return true
 end
 
--- the next egg to steal: rare first, then the hardest area you're allowed
+-- the next egg to steal: rarest first, then the hardest area you're allowed
 -- in (better eggs), then the nearest
 function Farm.PickTarget()
     local root = getRoot()
@@ -2052,14 +2224,15 @@ function Farm.PickTarget()
     local now = os.clock()
     local list = {}
     for _, target in ipairs(World.EggTargets()) do
-        if Farm.Allowed(target, speed) and (Farm.Skip[target.Prompt] or 0) < now then
+        local key = target.Uid or target.Prompt
+        if Farm.Allowed(target, speed) and (Farm.Skip[key] or 0) < now then
             target.Distance = (target.Position - from).Magnitude
             table.insert(list, target)
         end
     end
     Farm.Available = #list
     table.sort(list, function(a, b)
-        if a.Rare ~= b.Rare then return a.Rare end
+        if a.Rank ~= b.Rank then return a.Rank > b.Rank end
         local ra, rb = a.Area and a.Area.Rank or 0, b.Area and b.Area.Rank or 0
         if ra ~= rb then return ra > rb end
         return a.Distance < b.Distance
@@ -2072,7 +2245,7 @@ function Farm.TeleportTo(goal, shouldContinue)
     Farm.Pin = goal
     local root = getRoot()
     if root then root.CFrame = goal end
-    task.wait(0.2) -- let the server see you there
+    task.wait(0.25) -- let the server see you there
     return shouldContinue()
 end
 
@@ -2097,39 +2270,48 @@ function Farm.FlyTo(goal, shouldContinue, speed)
     return shouldContinue()
 end
 
--- "ok", "gone", "failed" or "cancelled"
+-- is the egg still there to steal?
+function Farm.StillOut(target)
+    if target.Prompt then return target.Prompt.Parent ~= nil and target.Part.Parent ~= nil end
+    for _, r in ipairs(World.Field or {}) do
+        if r.Uid == target.Uid then return r.State == "Slot" or r.State == "Dropped" end
+    end
+    return false
+end
+
+-- "ok", "gone", "failed" or "cancelled" (and the server's reason)
 function Farm.Steal(target, shouldContinue)
     local area = target.Area and target.Area.Name or "?"
     Farm.SetStatus("⚡ Going to " .. target.Name .. " (" .. area .. ")")
+    -- right next to the egg (the game allows 8 studs)
     if not Farm.TeleportTo(CFrame.new(target.Position + Vector3.new(0, 3, 0)), shouldContinue) then return "cancelled" end
-    if Farm.TargetGone(target) then return "gone" end
-
-    -- wait a moment if the prompt is switched off (egg still landing)
-    local t = os.clock()
-    while target.Prompt.Parent and not target.Prompt.Enabled and os.clock() - t < 2 do
-        if not shouldContinue() then return "cancelled" end
-        task.wait(0.1)
-    end
-    task.wait(0.25)
+    if not Farm.StillOut(target) then return "gone" end
 
     Farm.SetStatus("🫳 Stealing " .. target.Name)
+    local reason
     for _ = 1, 3 do
         if not shouldContinue() then return "cancelled" end
-        local carriedBefore = Farm.LastCarry
-        triggerPrompt(target.Prompt)
-        local start = os.clock()
-        while os.clock() - start < 1.5 do
-            if Farm.LastCarry ~= carriedBefore or Farm.TargetGone(target) or not target.Prompt.Enabled then
-                return "ok"
+        if target.Uid then
+            local ok, why = World.Carry(target.Uid, target.Record)
+            if ok then return "ok" end
+            reason = why
+            if not Farm.StillOut(target) then return "gone" end
+            task.wait(0.4)
+        else
+            local carriedBefore = Farm.LastCarry
+            triggerPrompt(target.Prompt)
+            local start = os.clock()
+            while os.clock() - start < 2 do
+                if Farm.LastCarry ~= carriedBefore or not target.Prompt.Parent then return "ok" end
+                task.wait(0.1)
             end
-            task.wait(0.1)
         end
     end
-    return "failed"
+    return "failed", reason
 end
 
--- back to your plot (teleport or fly), then wait there so the egg counts.
--- Returns true once you're home.
+-- back to your plot (teleport or fly), then wait for the server to count
+-- the egg. Returns true when it was counted (or you're no longer carrying).
 function Farm.GoHome(shouldContinue)
     local home = World.HomeCFrame()
     if not home then
@@ -2137,6 +2319,7 @@ function Farm.GoHome(shouldContinue)
         return false
     end
     Farm.SetStatus(Farm.HomeMode == "Fly" and "✈️ Flying home with the egg" or "🏡 Teleporting home with the egg")
+    local verdictBefore = Farm.LastVerdict
     local moved
     if Farm.HomeMode == "Fly" then
         moved = Farm.FlyTo(home, shouldContinue, Farm.FlySpeed)
@@ -2145,14 +2328,13 @@ function Farm.GoHome(shouldContinue)
     end
     if not moved then return false end
     Farm.SetStatus("📦 Bringing the egg in")
-    local verdictBefore = Farm.LastVerdict
     local t = os.clock()
     while os.clock() - t < Farm.DeliverWait and shouldContinue() do
-        if Farm.LastVerdict ~= verdictBefore then break end
+        if Farm.LastVerdict ~= verdictBefore then return true end
         task.wait(0.1)
     end
-    Farm.Carrying = false
-    return true
+    -- no "You stole an EGG!": counted only if the server stopped the carry
+    return Farm.LastVerdict ~= verdictBefore or not Farm.Carrying, true
 end
 
 function Farm.Loop(token)
@@ -2161,37 +2343,48 @@ function Farm.Loop(token)
     end
     local idleSince
     while shouldContinue() do
-        local target = Farm.PickTarget()
+        if Farm.Carrying then
+            -- already carrying one (from before, or the last trip didn't land)
+            Farm.GoHome(shouldContinue)
+            Farm.Pin = nil
+            task.wait(0.3)
+        end
+        local target = shouldContinue() and Farm.PickTarget()
+        if not shouldContinue() then break end
         if not target then
             if not idleSince then
                 idleSince = os.clock()
-                Farm.Pin = nil
-                if not World.IsHome() then
-                    local home = World.HomeCFrame()
-                    if home then Farm.TeleportTo(home, shouldContinue) end
-                    Farm.Pin = nil
-                end
+                local spot = (Farm.IdleTreadmill and World.TreadmillCFrame()) or World.HomeCFrame()
+                if spot then Farm.TeleportTo(spot, shouldContinue) end
+                -- stand still on the treadmill (the game trains you there)
+                Farm.Pin = Farm.IdleTreadmill and spot or nil
             end
-            Farm.SetStatus("🔎 Waiting for eggs (" .. math.floor(os.clock() - idleSince) .. "s)")
+            Farm.SetStatus((Farm.IdleTreadmill and "🏃 Training on the treadmill, " or "🔎 ")
+                .. "waiting for eggs (" .. math.floor(os.clock() - idleSince) .. "s)")
             task.wait(1)
         else
             idleSince = nil
-            local result = Farm.Steal(target, shouldContinue)
+            Farm.Pin = nil
+            local result, reason = Farm.Steal(target, shouldContinue)
             if result == "ok" then
-                if Farm.GoHome(shouldContinue) then
+                local counted, arrived = Farm.GoHome(shouldContinue)
+                if counted then
                     Farm.Stolen += 1
                     Farm.SessionStolen += 1
-                    Farm.Last = target.Name .. " (" .. (target.Area and target.Area.Name or "?") .. ")"
+                    Farm.Last = Farm.Last or target.Name
                     Farm.SetStatus("✅ Brought home " .. target.Name)
+                elseif arrived then
+                    Farm.SetStatus("⚠️ The egg didn't count. Try flying home (Steal tab).")
                 end
                 Farm.Pin = nil
                 task.wait(0.3)
             elseif result == "gone" then
                 Farm.SetStatus("💨 Someone took it, next egg")
             elseif result == "failed" then
-                Farm.Skip[target.Prompt] = os.clock() + 20
-                Farm.SetStatus("⏭️ Couldn't steal it, skipping for now")
-                task.wait(0.2)
+                Farm.Skip[target.Uid or target.Prompt] = os.clock() + 20
+                Farm.LastReason = reason
+                Farm.SetStatus("⏭️ Couldn't steal it" .. (reason and (": " .. tostring(reason)) or "") .. ", skipping")
+                task.wait(0.3)
             end
         end
     end
@@ -2250,8 +2443,20 @@ do
     end))
 end
 
--- ========================= OTHER AUTO FEATURES =========================
-local Auto = { AntiAfk = true }
+-- ========================= BASE AUTOMATION =========================
+-- place stolen eggs, hatch grown ones, collect away earnings, equip your
+-- best pets, train on the treadmill. Runs in its own thread (game calls).
+local Auto = {
+    AntiAfk = true,
+    Place = false, Hatch = false, Collect = false, EquipBest = false, Treadmill = false,
+    Placed = 0, Hatched = 0, Collected = 0,
+    Log = {},
+}
+function Auto.Note(text)
+    table.insert(Auto.Log, 1, text)
+    if #Auto.Log > 8 then table.remove(Auto.Log) end
+end
+
 isolate(function()
     local VirtualUser = game:GetService("VirtualUser")
     track(LocalPlayer.Idled:Connect(function()
@@ -2261,6 +2466,115 @@ isolate(function()
             VirtualUser:ClickButton2(Vector2.new())
         end)
     end))
+
+    -- free spots on your pen floor: a grid, minus spots next to placed eggs
+    local function freeSpots()
+        local area, center = World.PlotPart("PetArea"), World.PlotPart("CenterPoint")
+        if not (area and center) then return {}, nil end
+        local taken = {}
+        for _, record in pairs(World.Owned) do
+            local placement = type(record) == "table" and record.Placement
+            local cf = type(placement) == "table" and placement.LocalCFrame
+            if typeof(cf) == "CFrame" then table.insert(taken, center.CFrame:PointToWorldSpace(cf.Position)) end
+        end
+        local spots = {}
+        local step = 7
+        local halfX, halfZ = area.Size.X / 2 - 4, area.Size.Z / 2 - 4
+        for x = -halfX, halfX, step do
+            for z = -halfZ, halfZ, step do
+                local world = area.CFrame:PointToWorldSpace(Vector3.new(x, area.Size.Y / 2, z))
+                local free = true
+                for _, p in ipairs(taken) do
+                    if ((p - world) * Vector3.new(1, 0, 1)).Magnitude < 6 then
+                        free = false
+                        break
+                    end
+                end
+                if free then table.insert(spots, world) end
+            end
+        end
+        return spots, center
+    end
+
+    local function placeEggs()
+        if Farm.Carrying then return end
+        local tools = World.EggTools()
+        if #tools == 0 then return end
+        local spots, center = freeSpots()
+        local hum = getHumanoid()
+        local spotIndex = 1
+        for _, tool in ipairs(tools) do
+            if not Auto.Place or Farm.Carrying then return end
+            local uid = tool:GetAttribute("UID")
+            -- the game places the egg you're holding
+            if hum and tool.Parent ~= LocalPlayer.Character then
+                pcall(function() hum:EquipTool(tool) end)
+                task.wait(0.3)
+            end
+            local placed, reason = false, nil
+            while not placed and spotIndex <= #spots do
+                local spot = spots[spotIndex]
+                spotIndex += 1
+                placed, reason = World.Plant(uid, center.CFrame:ToObjectSpace(CFrame.new(spot)))
+            end
+            if placed then
+                Auto.Placed += 1
+                Auto.Note("🥚 Placed an egg")
+            else
+                Auto.Note("⚠️ Couldn't place: " .. tostring(reason or "pen is full"))
+                break
+            end
+            task.wait(0.3)
+        end
+        if hum then pcall(function() hum:UnequipTools() end) end
+    end
+
+    local function hatchEggs()
+        for uid, record in pairs(World.Owned) do
+            if not Auto.Hatch then return end
+            if type(record) == "table" and record.Placement ~= nil and World.ReadyToHatch(uid, record) then
+                local ok, reason = World.Hatch(uid)
+                if ok then
+                    Auto.Hatched += 1
+                    Auto.Note("🐣 Hatched " .. World.AssetInfo(record.AssetCategory).Name)
+                else
+                    Auto.Note("⚠️ Hatch failed: " .. tostring(reason))
+                end
+                task.wait(0.5)
+            end
+        end
+    end
+
+    local nextCollect, nextEquip = 0, 0
+    task.spawn(function()
+        while Alive do
+            local now = os.clock()
+            if Auto.Place then pcall(placeEggs) end
+            if Auto.Hatch then pcall(hatchEggs) end
+            if Auto.Collect and now >= nextCollect then
+                nextCollect = now + 60
+                local ok, _, result = World.Invoke("AwayEarnings", "AskCollect", { Kind = "Claim" })
+                if ok then
+                    Auto.Collected += 1
+                    local amount = type(result) == "table" and tonumber(result.AwardedAmount)
+                    Auto.Note("💰 Collected away earnings" .. (amount and (" $" .. World.Short(amount)) or ""))
+                end
+            end
+            if Auto.EquipBest and now >= nextEquip then
+                nextEquip = now + 45
+                World.Invoke("Haul", "WearBest")
+            end
+            -- treadmill on its own (auto steal has its own idle treadmill)
+            if Auto.Treadmill and not Farm.Enabled then
+                local spot = World.TreadmillCFrame()
+                if spot then Farm.Pin = spot end
+            elseif Auto.TreadmillPinned and not Farm.Enabled then
+                Farm.Pin = nil
+            end
+            Auto.TreadmillPinned = Auto.Treadmill and not Farm.Enabled
+            task.wait(1)
+        end
+    end)
 end)
 
 -- ========================= OPEN / CLOSE / MINIMIZE =========================
@@ -3238,6 +3552,7 @@ isolate(function()
         local root = getRoot()
         if not root then return notify("📍 Can't teleport", "Your character hasn't loaded.") end
         if Farm.Enabled then return notify("📍 Auto steal is on", "Stop it first, it's moving you around.") end
+        if Auto.Treadmill then return notify("📍 Treadmill is on", "Turn off \"Stand on my treadmill\" first.") end
         Travel.Back = root.Position
         refreshBack()
         Travel.Token += 1
@@ -3602,7 +3917,32 @@ Farm.RenderUI()
 -- 🎯 which eggs
 StealTab:Section("🎯 Which eggs")
 StealTab:Toggle("🛡️ Only areas my Speed is high enough for", Farm.SafeOnly, function(on) Farm.SafeOnly = on end)
-StealTab:Toggle("⭐ Rare eggs only (the glowing ones)", false, function(on) Farm.RareOnly = on end)
+-- lowest rarity to steal: a dropdown of the game's tiers
+do
+    local key = "MinRarity"
+    local rarityGroup
+    local function apply(name, rank)
+        Farm.MinRank = rank
+        rarityGroup.SetTitle("⭐ Lowest rarity: " .. name)
+        SavedSettings[key] = name
+        queueSave()
+    end
+    rarityGroup = StealTab:Dropdown("⭐ Lowest rarity: Any", false)
+    rarityGroup:Option("Any rarity", function() apply("Any", 0) end)
+    for _, tier in ipairs(World.Rarities) do
+        if tier[2] > 1 then
+            rarityGroup:Option(tier[1] .. " and better", function() apply(tier[1] .. "+", tier[2]) end)
+        end
+    end
+    local saved = SavedSettings[key]
+    for _, tier in ipairs(World.Rarities) do
+        if saved == tier[1] .. "+" then
+            Farm.MinRank = tier[2]
+            rarityGroup.SetTitle("⭐ Lowest rarity: " .. saved)
+        end
+    end
+    table.insert(DefaultResetters, function() apply("Any", 0) end)
+end
 local areaGroup = StealTab:Dropdown("🗺️ Areas to steal from (" .. #areas .. ")", false)
 for _, area in ipairs(areas) do
     areaGroup:Toggle(string.format("%s  ·  ⚡ %s", area.Name, World.Short(area.Need)), true, function(on)
@@ -3616,11 +3956,40 @@ StealTab:Toggle("✈️ Fly home instead of teleporting", false, function(on)
     Farm.HomeMode = on and "Fly" or "Teleport"
 end)
 StealTab:Slider("🚀 Fly-home speed", 40, 600, Farm.FlySpeed, function(v) Farm.FlySpeed = v end)
-StealTab:Slider("⏱️ Wait at home (tenths of a second)", 5, 60, math.floor(Farm.DeliverWait * 10 + 0.5), function(v)
+StealTab:Slider("⏱️ Wait at home (tenths of a second)", 10, 80, math.floor(Farm.DeliverWait * 10 + 0.5), function(v)
     Farm.DeliverWait = v / 10
 end)
-StealTab:Label("Each trip: teleport to the egg, press Steal, then go home and wait a moment so the egg counts. "
-    .. "If eggs don't count when you teleport, try flying home.")
+StealTab:Toggle("🏃 Train on my treadmill while no eggs are out", Farm.IdleTreadmill, function(on) Farm.IdleTreadmill = on end)
+StealTab:Label("Each trip: teleport next to the egg, steal it (the game's own request), then go home until the game says "
+    .. "\"You stole an EGG!\". If eggs don't count when you teleport, try flying home.")
+
+-- 🏡 your base: place, hatch, collect
+StealTab:Section("🏡 Your base")
+StealTab:Toggle("🥚 Auto place stolen eggs in my pen", false, function(on) Auto.Place = on end)
+StealTab:Toggle("🐣 Auto hatch grown eggs", false, function(on) Auto.Hatch = on end)
+StealTab:Toggle("💰 Auto collect away earnings", false, function(on) Auto.Collect = on end)
+StealTab:Toggle("⭐ Auto equip best pets", false, function(on) Auto.EquipBest = on end)
+local treadmillToggle = StealTab:Toggle("🏃 Stand on my treadmill (train Speed)", false, function(on)
+    Auto.Treadmill = on
+    if on and Farm.Enabled then notify("🏃 Treadmill", "Auto steal is on: it trains here whenever no eggs are out.", 3) end
+end)
+table.insert(Mobile.Targets, { Id = "Treadmill", Icon = "🏃", Label = "Treadmill", Toggle = treadmillToggle })
+local baseLabel = StealTab:Label("")
+local nextBase = 0
+track(RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+    if now < nextBase or not Holder.Visible or ActiveTab ~= StealTab then return end
+    nextBase = now + 1
+    local waiting = #World.EggTools()
+    local growing = 0
+    for _, record in pairs(World.Owned) do
+        if type(record) == "table" and record.Placement ~= nil then growing += 1 end
+    end
+    local lines = { string.format("🥚 %d egg%s to place · 🌱 %d in the pen · 🐣 %d hatched · 🥚 %d placed",
+        waiting, waiting == 1 and "" or "s", growing, Auto.Hatched, Auto.Placed) }
+    for i = 1, math.min(#Auto.Log, 3) do table.insert(lines, "<font transparency=\"0.3\">" .. Auto.Log[i] .. "</font>") end
+    baseLabel.Text = table.concat(lines, "\n")
+end))
 
 -- 🛡️ guards
 StealTab:Section("🛡️ Guards")
@@ -3636,14 +4005,15 @@ local function refreshEggs()
     table.clear(items)
     local list = World.EggTargets()
     table.sort(list, function(a, b)
+        if a.Rank ~= b.Rank then return a.Rank > b.Rank end
         local ra, rb = a.Area and a.Area.Rank or 0, b.Area and b.Area.Rank or 0
         if ra ~= rb then return ra > rb end
         return a.Name < b.Name
     end)
     eggGroup.SetTitle("🥚 Eggs in the areas (" .. #list .. ")")
     for _, target in ipairs(list) do
-        local text = string.format("%s%s  ·  %s", target.Rare and "⭐ " or "", target.Name,
-            target.Area and target.Area.Name or "?")
+        local text = string.format("%s%s  ·  %s  ·  %s", target.Rare and "⭐ " or "", target.Name,
+            target.Rarity or "?", target.Area and target.Area.Name or "?")
         table.insert(items, eggGroup:Option(text, function()
             if Farm.Enabled then return notify("🥚 Auto steal is on", "Stop it first, it's moving you around.") end
             local root = getRoot()
@@ -3655,6 +4025,7 @@ local function refreshEggs()
 end
 StealTab:Button("🔄 Refresh the egg list", refreshEggs)
 refreshEggs()
+task.delay(4, function() if Alive then pcall(refreshEggs) end end) -- once the game's egg list has been read
 end)
 
 -- 👁️ ESP
@@ -3679,7 +4050,12 @@ safeSection("ESP", function()
         if old then old:Destroy() end
         container.Parent = parent
     end)
-    table.insert(UnloadHooks, function() container:Destroy() end)
+    table.insert(UnloadHooks, function()
+        container:Destroy()
+        for _, c in ipairs(workspace.Terrain:GetChildren()) do
+            if c.Name == "SmurfysEspAnchor" then c:Destroy() end
+        end
+    end)
 
     local entries = {} -- [Model] = entry
 
@@ -3783,6 +4159,7 @@ safeSection("ESP", function()
         entries[key] = nil
         e.Highlight:Destroy()
         e.Billboard:Destroy()
+        if e.Anchor then e.Anchor:Destroy() end
     end
 
     local function infoText(first, dist)
@@ -3832,19 +4209,30 @@ safeSection("ESP", function()
         if ESP.Eggs then
             for _, target in ipairs(targets) do
                 local dist = (target.Position - origin).Magnitude
-                local key = target.Part
+                local key = target.Uid or target.Part
                 if dist <= ESP.MaxDistance then
-                    local color = target.Rare and RARE_COLOR or EGG_COLOR
+                    local color = target.Color or (target.Rare and RARE_COLOR or EGG_COLOR)
                     local e = entries[key]
                     if not e then
-                        e = newEntry(target.Model or target.Part, color)
-                        e.Billboard.Adornee = target.Part
+                        local model = target.Uid and World.EggModel(target.Uid)
+                        e = newEntry(model or target.Part, color)
+                        if model or target.Part then
+                            e.Billboard.Adornee = model or target.Part
+                        else
+                            -- no model drawn (yet): pin the label to the egg's spot
+                            local anchor = create("Attachment", { Name = "SmurfysEspAnchor", Parent = workspace.Terrain })
+                            anchor.WorldPosition = target.Position
+                            e.Anchor = anchor
+                            e.Billboard.Adornee = anchor
+                        end
                         e.Billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
                         entries[key] = e
                     end
                     setColor(e, color)
                     e.Name.Text = (target.Rare and "⭐ " or "") .. target.Name
-                    e.Info.Text = infoText(target.Area and target.Area.Name or nil, dist)
+                    local rarity = target.Rarity ~= "?" and target.Rarity or nil
+                    local where = target.Area and target.Area.Name or nil
+                    e.Info.Text = infoText(rarity and where and (rarity .. " · " .. where) or rarity or where, dist)
                     seen[key] = true
                     table.insert(shown, { e, dist })
                 end
@@ -3906,7 +4294,7 @@ safeSection("ESP", function()
 
     EspTab:Section("👁️ Show")
     EspTab:Toggle("🧍 Players", false, function(on) ESP.Players = on end)
-    EspTab:Toggle("🥚 Eggs (⭐ rare in gold)", false, function(on) ESP.Eggs = on end)
+    EspTab:Toggle("🥚 Eggs (colored by rarity)", false, function(on) ESP.Eggs = on end)
     EspTab:Toggle("🛡️ Guards (red when awake)", false, function(on) ESP.Guards = on end)
 
     EspTab:Section("🎨 Style")
@@ -4552,14 +4940,22 @@ safeSection("Debug", function()
             end
         end)
         try("eggs", function()
+            local mods = {}
+            for name, mod in pairs(World.Mods) do if mod then table.insert(mods, name) end end
+            table.sort(mods)
+            add("game modules: %s · records: %s (%.0fs old)", table.concat(mods, ", "),
+                World.Field and tostring(#World.Field) or "none", os.clock() - World.FieldAt)
             local list = World.EggTargets()
             add("eggs out: %d", #list)
             for i = 1, math.min(#list, 8) do
                 local t = list[i]
-                add("  %s%s in %s · enabled=%s hold=%s range=%s sight=%s", t.Rare and "RARE " or "", t.Name,
-                    t.Area and t.Area.Name or "?", tostring(t.Prompt.Enabled), tostring(t.Prompt.HoldDuration),
-                    tostring(t.Prompt.MaxActivationDistance), tostring(t.Prompt.RequiresLineOfSight))
+                add("  %s (%s) in %s · %s", t.Name, tostring(t.Rarity), t.Area and t.Area.Name or "?",
+                    t.Uid and ("uid " .. string.sub(t.Uid, 1, 18)) or "prompt only")
             end
+            local owned = 0
+            for _ in pairs(World.Owned) do owned += 1 end
+            add("my eggs: %d · egg tools: %d · last steal failure: %s", owned, #World.EggTools(), tostring(Farm.LastReason))
+            for i = 1, math.min(#Auto.Log, 5) do add("  %s", Auto.Log[i]) end
         end)
         try("prompts", function()
             -- prompts around your plot (hatching / placing may use them)

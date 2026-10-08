@@ -26,10 +26,12 @@ for device in phone pc; do
         status=1
     fi
 done
-# auto steal in the fake Steal An Egg (steal_game.lua + steal_driver.lua)
+# auto steal in the fake Steal An Egg (steal_game.lua + steal_driver.lua).
+# The pc run can't use the game's modules, so it checks the remotes fallback.
 for device in phone pc; do
     {
         sed "s/__DEVICE__/\"$device\"/g" harness.lua
+        [ "$device" = pc ] && echo "__NO_MODULES = true"
         cat steal_game.lua
         printf '\nfunction __main(...)\n'
         cat "$FILE"

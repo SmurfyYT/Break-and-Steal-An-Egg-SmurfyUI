@@ -1,5 +1,8 @@
--- Plays auto steal in the fake game (steal_game.lua) and checks it.
+-- Plays auto steal and the base automation in the fake game (steal_game.lua).
+-- With __NO_MODULES the script can't use the game's modules and must fall
+-- back to the remotes.
 local failures = 0
+local MODULES = not __NO_MODULES
 local function check(cond, what)
     print((cond and "  PASS  " or "  FAIL  ") .. what)
     if not cond then failures += 1 end
@@ -19,61 +22,80 @@ local function labelHas(pattern)
     end
     return false
 end
-local function atHome()
-    return ((__root.Position - __SG.home) * Vector3.new(1, 0, 1)).Magnitude < 5
+local function near(pos, r)
+    return ((__root.Position - pos) * Vector3.new(1, 0, 1)).Magnitude < (r or 5)
 end
 
 -- eggs out before the script loads
-__SG.spawnEgg("Petal Beetle", 150, 20)
-__SG.spawnEgg("Prism Gecko", 250, -30, true) -- rare
-local snowEgg = __SG.spawnEgg("Frost Owl", 480, 10) -- Snow needs 1M speed, you have 5K
+local beetle = __SG.spawnEgg("Petal Beetle", 150, 20) -- the tutorial egg (needs the slot key)
+local gecko = __SG.spawnEgg("Prism Gecko", 250, -30)  -- Mythic
+local owl = __SG.spawnEgg("Frost Owl", 480, 10)       -- Snow needs 1M speed, you have 5K
 
 local ok, err = xpcall(__main, debug.traceback)
 check(ok, "script loads" .. (ok and "" or (": " .. tostring(err))))
 if not ok then return end
 __runFrames(30)
 check(__findText("▶  Start auto steal") ~= nil, "Steal tab built")
-check(labelHas("Eggs in the areas %(3%)"), "egg list shows the 3 eggs")
 check(__findText("Forest  ·  ⚡ 10") ~= nil and __findText("Snow  ·  ⚡ 1M") ~= nil, "area toggles with the speed needed")
 -- open the Steal tab (phones show icons only)
 if not __findText("🥚") or not click("🥚") then click("🥚   Steal") end
-__runFrames(150)
+__runFrames(60 * 5)
 check(labelHas("^2$"), "2 eggs you can steal (Snow is too hard)")
+check(labelHas("Eggs in the areas %(3%)"), "egg list shows the 3 eggs")
+if MODULES then check(labelHas("Prism Gecko  ·  Mythic  ·  Forest"), "egg list shows pet, rarity and area") end
 
--- 1. steals the two Forest eggs (rare first), skips Snow, brings them home
+-- 1. steals the two Forest eggs, skips Snow, brings them home, then trains
 check(click("▶  Start auto steal"), "Start button")
 __runFrames(60 * 15)
 check(__SG.delivered == 2, "2 eggs brought home (" .. __SG.delivered .. ")")
-check(__SG.stolen[1] == "Prism Gecko", "rare egg first (" .. tostring(__SG.stolen[1]) .. ")")
-check(snowEgg.Parent ~= nil, "Snow egg left alone (not enough speed)")
-check(labelHas("Waiting for eggs"), "then it waits for more")
-check(atHome(), "waits at home")
+if MODULES then check(__SG.stolen[1] == "Prism Gecko", "rarest egg first (" .. tostring(__SG.stolen[1]) .. ")") end
+check(not __SG.eggOut(beetle), "the tutorial egg (slot key) was stolen too")
+check(__SG.eggOut(owl), "Snow egg left alone (not enough speed)")
+check(labelHas("waiting for eggs"), "then it waits for more")
+local speedBefore = __SG.speed.Value
+__runFrames(60 * 3)
+check(near(__SG.treadmill, 4) and __SG.speed.Value > speedBefore, "trains on the treadmill while waiting")
+check(#__SG.backpack:GetChildren() == 2, "2 egg tools in the backpack")
 
 -- 2. new egg appears: it goes and gets it
 __SG.spawnEgg("Moss Toad", 180, 50)
 __runFrames(60 * 8)
 check(__SG.delivered == 3, "new egg stolen too (" .. __SG.delivered .. ")")
 
--- 3. turn off "only areas my speed is high enough for": Snow egg gets stolen
+-- 3. "only areas my speed is high enough for" off: Snow egg gets stolen
 click("🛡️ Only areas my Speed is high enough for")
 __runFrames(60 * 8)
-check(__SG.delivered == 4 and snowEgg.Parent == nil, "Snow egg stolen once allowed (" .. __SG.delivered .. ")")
+check(__SG.delivered == 4 and not __SG.eggOut(owl), "Snow egg stolen once allowed (" .. __SG.delivered .. ")")
 
 -- 4. stop
 check(click("■  Stop auto steal"), "Stop button")
 __runFrames(30)
 check(labelHas("Idle"), "status idle after stop")
+check(near(__SG.home, 25), "stop leaves you at your base (home or treadmill)")
 
 -- 5. area filter: Forest off -> a Forest egg is ignored
 click("Forest  ·  ⚡ 10")
 local forestEgg = __SG.spawnEgg("Petal Beetle", 160, -10)
 click("▶  Start auto steal")
 __runFrames(60 * 6)
-check(forestEgg.Parent ~= nil and __SG.delivered == 4, "Forest egg ignored when Forest is off")
+check(__SG.eggOut(forestEgg) and __SG.delivered == 4, "Forest egg ignored when Forest is off")
 click("■  Stop auto steal")
 click("Forest  ·  ⚡ 10")
 
--- 6. fly home instead of teleporting
+-- 6. lowest rarity: Mythic+ ignores a Common egg
+if MODULES then
+    click("⭐ Lowest rarity: Any")
+    click("Mythic and better")
+    check(labelHas("Lowest rarity: Mythic%+"), "rarity filter set")
+    click("▶  Start auto steal")
+    __runFrames(60 * 6)
+    check(__SG.eggOut(forestEgg) and __SG.delivered == 4, "Common egg ignored with Mythic+")
+    click("■  Stop auto steal")
+    click("⭐ Lowest rarity: Mythic+")
+    click("Any rarity")
+end
+
+-- 7. fly home instead of teleporting
 click("✈️ Fly home instead of teleporting")
 click("▶  Start auto steal")
 __runFrames(60 * 15)
@@ -81,40 +103,65 @@ check(__SG.delivered == 5, "egg brought home by flying (" .. __SG.delivered .. "
 click("■  Stop auto steal")
 click("✈️ Fly home instead of teleporting")
 
--- 7. guard chase: warns and (when on) takes you home
+-- 8. base: place the egg tools, hatch them when grown, collect, equip best
+click("🥚 Auto place stolen eggs in my pen")
+__runFrames(60 * 6)
+check(__SG.placed == 5, "5 eggs placed in the pen (" .. __SG.placed .. ")")
+check(#__SG.backpack:GetChildren() == 0, "no egg tools left")
+if MODULES then
+    click("🐣 Auto hatch grown eggs")
+    __runFrames(60 * 25)
+    check(__SG.hatched == 5, "5 eggs hatched once grown (" .. __SG.hatched .. ")")
+    click("🐣 Auto hatch grown eggs")
+end
+click("💰 Auto collect away earnings")
+click("⭐ Auto equip best pets")
+__runFrames(60 * 3)
+check(__SG.collected >= 1 and __SG.woreBest >= 1, "away earnings collected and best pets equipped")
+click("💰 Auto collect away earnings")
+click("⭐ Auto equip best pets")
+click("🥚 Auto place stolen eggs in my pen")
+
+-- 9. treadmill on its own
+click("🏃 Stand on my treadmill (train Speed)")
+__runFrames(60 * 3)
+check(near(__SG.treadmill, 4), "stands on the treadmill")
+click("🏃 Stand on my treadmill (train Speed)")
+__runFrames(60 * 2)
+
+-- 10. guard chase: warns and (when on) takes you home
 click("🏃 Teleport home when a guard chases me")
 __root.CFrame = CFrame.new(Vector3.new(200, 5, 0))
 __runFrames(5)
 __SG.guards.Forest:SetAttribute("TargetPlayer", "Tester")
 __runFrames(30)
-check(atHome(), "guard chase -> teleported home")
+check(near(__SG.home), "guard chase -> teleported home")
 check(labelHas("Guard chasing you"), "guard chase notification")
 __SG.guards.Forest:SetAttribute("TargetPlayer", "")
 
--- 8. teleports: my plot, an area
+-- 11. teleports: my plot, an area
 __root.CFrame = CFrame.new(Vector3.new(300, 5, 0))
 click("🏡 My plot")
-check(atHome(), "Teleport > My plot")
+check(near(__SG.home), "Teleport > My plot")
 click("Snow  ·  ⚡ 1M speed")
 check(math.abs(__root.Position.X - 410) < 2, "Teleport > Snow area (" .. math.floor(__root.Position.X) .. ")")
 
--- 9. ESP for eggs and guards builds without errors
-__SG.spawnEgg("Moss Toad", 190, 40, true)
-click("🥚 Eggs (⭐ rare in gold)")
+-- 12. ESP for eggs and guards builds without errors
+__SG.spawnEgg("Prism Gecko", 190, 40)
+click("🥚 Eggs (colored by rarity)")
 click("🛡️ Guards (red when awake)")
-__runFrames(30)
+__runFrames(60 * 4)
 local billboards = 0
 for _, i in ipairs(__all()) do
     if i.ClassName == "BillboardGui" and i.Parent and i.Parent.Name == "SmurfysESP" and i.Enabled ~= false then billboards += 1 end
 end
 check(billboards >= 3, "ESP billboards for eggs + guards (" .. billboards .. ")")
 
--- 10. debug report
+-- 13. debug report
 click("📋 Copy debug report")
 check(labelHas("Report"), "debug report done")
 
--- unload while auto steal runs: stops and goes home
-__SG.spawnEgg("Petal Beetle", 140, 30)
+-- unload while auto steal runs
 click("▶  Start auto steal")
 __runFrames(3)
 click("🗑️ Unload UI")
