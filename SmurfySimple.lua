@@ -1015,14 +1015,16 @@ do
         local dir = (target.Position - root.Position)
         if dir.Magnitude < 0.1 then out("Already there.") return end
         noclip(true)
-        zeroMotion(root)
-        root.AssemblyLinearVelocity = dir.Unit * Settings.PinSpeed
         local t0 = os.clock()
         local limit = dist / Settings.PinSpeed + 1
         while labRunning(token) and os.clock() - t0 < limit do
             local r2 = getRoot()
             if not r2 then break end
-            if (r2.Position - target.Position).Magnitude < 5 then break end
+            local remaining = target.Position - r2.Position
+            if remaining.Magnitude < 5 then break end
+            -- re-aim every frame so gravity never accumulates
+            r2.AssemblyAngularVelocity = Vector3.zero
+            r2.AssemblyLinearVelocity = remaining.Unit * Settings.PinSpeed
             RunService.Stepped:Wait()
         end
         noclip(false)
