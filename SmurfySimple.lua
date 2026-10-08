@@ -1014,6 +1014,7 @@ do
         markOwn(dist / Settings.PinSpeed + 1)
         local dir = (target.Position - root.Position)
         if dir.Magnitude < 0.1 then out("Already there.") return end
+        noclip(true)
         zeroMotion(root)
         root.AssemblyLinearVelocity = dir.Unit * Settings.PinSpeed
         local t0 = os.clock()
@@ -1024,6 +1025,7 @@ do
             if (r2.Position - target.Position).Magnitude < 5 then break end
             RunService.Stepped:Wait()
         end
+        noclip(false)
         local r2 = getRoot()
         if r2 then zeroMotion(r2) end
         local r = watch(target, root.CFrame, token)
